@@ -106,3 +106,9 @@ class RateLimitExceededError(FitCheckException):
     """Too many requests"""
     def __init__(self, message="Too many requests. Please wait a moment and try again."):
         super().__init__(message, code="RATE_LIMIT_EXCEEDED", status_code=429)
+        
+class GarmentUnsupportedError(FitCheckException):
+    """Garment representation built successfully, but shoulders_available
+    is False — expected V1 capability gap, not a server error."""
+    def __init__(self, message="This garment is not supported by the current try-on fitting pipeline."):
+        super().__init__(message, code="GARMENT_UNSUPPORTED", status_code=409)

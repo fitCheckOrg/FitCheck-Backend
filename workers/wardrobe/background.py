@@ -42,7 +42,7 @@ def remove_background(image_bytes: bytes) -> bytes:
 
                 files={"image_file": ("upload.png", image_bytes, "image/png")},
 
-                data={"size": "auto"},
+                data={"size": "auto", "crop": "true", "crop_margin": "5%"},
 
                 headers={"X-Api-Key": settings.REMOVE_BG_API_KEY},
 

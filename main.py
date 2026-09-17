@@ -10,6 +10,8 @@ from api.outfit import router as outfit_router
 from api.stylist import router as stylist_router
 from api.social import router as social_router
 from api.subscription import router as subscription_router
+from api.config import router as config_router
+from api.tryon import router as tryon_router
 
 
 app = FastAPI(title="FitCheck AI Service")
@@ -55,9 +57,13 @@ app.include_router(outfit_router, prefix="/api")
 app.include_router(stylist_router, prefix="/api")
 app.include_router(social_router, prefix="/api")
 app.include_router(subscription_router, prefix="/api")
+app.include_router(config_router, prefix="/api")
+app.include_router(tryon_router, prefix="/api")  # Added tryon router
+
 
 
 @app.get("/")
 def health_check():
     return { "status": "FitCheck AI service is running" }
 
+# uvicorn main:app --reload --port 8000

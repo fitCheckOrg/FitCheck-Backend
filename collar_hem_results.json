@@ -1,0 +1,122 @@
+[
+  {
+    "item_id": "f2944c50-5757-4abc-81a6-c1380f8419a0",
+    "item_type": "t-shirt",
+    "dominant_color": "black",
+    "stratum": "dark_short",
+    "algorithm_output": {
+      "collar": [
+        59.2,
+        5.7
+      ],
+      "hem": [
+        70.8,
+        94.1
+      ]
+    },
+    "human_judgment": null,
+    "confidence": null,
+    "failure_category": null,
+    "image_file": "collar_hem_f2944c50.png"
+  },
+  {
+    "item_id": "d20577a1-01e9-4d6f-87a1-5ca89c3badba",
+    "item_type": "t-shirt",
+    "dominant_color": "black",
+    "stratum": "dark_short",
+    "algorithm_output": {
+      "collar": [
+        59.2,
+        5.7
+      ],
+      "hem": [
+        70.8,
+        94.1
+      ]
+    },
+    "human_judgment": null,
+    "confidence": null,
+    "failure_category": null,
+    "image_file": "collar_hem_d20577a1.png"
+  },
+  {
+    "item_id": "ba2e5aa1-bfb5-462f-aaad-fe378f658c42",
+    "item_type": "long sleeve shirt",
+    "dominant_color": "black",
+    "stratum": "dark_long",
+    "algorithm_output": {
+      "collar": [
+        58.5,
+        4.6
+      ],
+      "hem": [
+        85.1,
+        95.1
+      ]
+    },
+    "human_judgment": null,
+    "confidence": null,
+    "failure_category": null,
+    "image_file": "collar_hem_ba2e5aa1.png"
+  },
+  {
+    "item_id": "6a53c00f-4f84-4e64-ad3b-5d2753504481",
+    "item_type": "dress shirt",
+    "dominant_color": "white",
+    "stratum": "light_short",
+    "algorithm_output": {
+      "collar": [
+        51.9,
+        12.3
+      ],
+      "hem": [
+        77.3,
+        95.4
+      ]
+    },
+    "human_judgment": null,
+    "confidence": null,
+    "failure_category": null,
+    "image_file": "collar_hem_6a53c00f.png"
+  },
+  {
+    "item_id": "52f5fd29-d817-49bb-a0c8-ba181ba47157",
+    "item_type": "button-up shirt",
+    "dominant_color": "white",
+    "stratum": "light_short",
+    "algorithm_output": {
+      "collar": [
+        64.5,
+        4.5
+      ],
+      "hem": [
+        80.2,
+        95.3
+      ]
+    },
+    "human_judgment": null,
+    "confidence": null,
+    "failure_category": null,
+    "image_file": "collar_hem_52f5fd29.png"
+  },
+  {
+    "item_id": "25989827-db9d-4d65-90b3-12f5357b0b44",
+    "item_type": "long sleeve t-shirt",
+    "dominant_color": "white",
+    "stratum": "light_long",
+    "algorithm_output": {
+      "collar": [
+        59.2,
+        4.7
+      ],
+      "hem": [
+        47.9,
+        95.3
+      ]
+    },
+    "human_judgment": null,
+    "confidence": null,
+    "failure_category": null,
+    "image_file": "collar_hem_25989827.png"
+  }
+]

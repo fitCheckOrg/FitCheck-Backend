@@ -46,7 +46,7 @@ class Settings:
         self.MAX_IMAGE_SIZE_MB = int(os.getenv("MAX_IMAGE_SIZE_MB", 10))
         self.MIN_IMAGE_DIMENSION = int(os.getenv("MIN_IMAGE_DIMENSION", 300))
         self.MAX_IMAGE_DIMENSION = int(os.getenv("MAX_IMAGE_DIMENSION", 6000))
-        self.BLUR_THRESHOLD = float(os.getenv("BLUR_THRESHOLD", 80.0))
+        self.BLUR_THRESHOLD = float(os.getenv("BLUR_THRESHOLD", 5.0))
         
         # Image enhancement
         self.CONTRAST_FACTOR = float(os.getenv("CONTRAST_FACTOR", 1.1))
@@ -73,6 +73,7 @@ class Settings:
         self.TIMES_WORN_WEIGHT = float(os.getenv("TIMES_WORN_WEIGHT", 1.5))
         self.ROTATION_SCORE_BAND = float(os.getenv("ROTATION_SCORE_BAND", 3))
         
+        self.POSE_MODEL_PATH = os.getenv("POSE_MODEL_PATH", "models/pose_landmarker.task")
         required = {
         "OPENAI_API_KEY": self.OPENAI_API_KEY,
         "AWS_BUCKET_NAME": self.AWS_BUCKET_NAME,

@@ -12,7 +12,8 @@ def save_avatar(
     profile: AvatarProfile,
     body_profile_ai: dict,
     photo_width: int,
-    photo_height: int
+    photo_height: int,
+    pose_keypoints: dict | None = None
 ) -> dict:
     """
     Upserts avatar to Supabase.
@@ -41,7 +42,9 @@ def save_avatar(
 
             "avatar_version": profile.avatar_version,
             "is_setup": profile.is_setup,
-            "status": "ready"
+            "status": "ready",
+            
+            "pose_keypoints": pose_keypoints,
         }
 
         # Upsert — insert or update on user_id conflict

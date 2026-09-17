@@ -9,6 +9,7 @@ from workers.wardrobe.background import remove_background
 from workers.avatar.analyzer import analyze_body
 from workers.avatar.generator import build_avatar_profile
 from workers.avatar.saver import save_avatar
+from workers.avatar.pose_estimator import estimate_pose
 
 logger = get_logger(__name__)
 
@@ -55,11 +56,37 @@ async def run_avatar_pipeline(
         enhanced_bytes = enhance_image(processed_bytes)
         logger.info("Step 3/7 — Image enhanced")
 
+        # Capture ACTUAL final dimensions — after crop, after enhance —
+        # not the original pre-crop dimensions. remove.bg's crop=true
+        # (added for wardrobe, shared by this pipeline) changes both
+        # size AND aspect ratio, so this can't be assumed to match
+        # the original upload.
+        from PIL import Image
+        import io as _io
+        final_image = Image.open(_io.BytesIO(enhanced_bytes))
+        photo_width, photo_height = final_image.size
+        logger.info("Actual processed dimensions: %dx%d", photo_width, photo_height)
+
         # 6. Analyze body BEFORE uploading — avoid S3 cost if GPT fails
         body_profile, body_profile_ai, orientation, accuracy = analyze_body(enhanced_bytes, "image/png")
         body_profile_ai["detected_orientation"] = orientation
         body_profile_ai["photo_accuracy"] = accuracy
         logger.info("Step 4/7 — Body analysis complete")
+
+        # 4b. Estimate pose keypoints on the FINAL PROCESSED photo —
+        # must match the coordinate system of processed_photo_url,
+        # which is what pose_keypoints will be applied against
+        # downstream. Previously ran on image_bytes (the ORIGINAL,
+        # pre-crop upload) while processed_photo_url stores the
+        # POST-crop image — a real aspect-ratio mismatch (confirmed
+        # via direct measurement: 0.5627 vs 0.3314, 41.1% difference)
+        # that silently corrupted every downstream landmark
+        # calculation using these normalized coordinates.
+        pose_keypoints = estimate_pose(enhanced_bytes)
+        if pose_keypoints:
+            logger.info("Step 4b/7 — Pose keypoints detected")
+        else:
+            logger.warning("Step 4b/7 — Pose keypoints not detected, continuing without them")
 
         # 7. Upload original to S3
         original_result = storage.upload(
@@ -92,11 +119,12 @@ async def run_avatar_pipeline(
 
         # 10. Save to Supabase
         saved_avatar = save_avatar(
-        profile=profile,
-        body_profile_ai=body_profile_ai,
-        photo_width=photo_width,
-        photo_height=photo_height
-    )
+            profile=profile,
+            body_profile_ai=body_profile_ai,
+            photo_width=photo_width,
+            photo_height=photo_height,
+            pose_keypoints=pose_keypoints
+        )
         logger.info("Step 7/7 — Avatar saved to database")
 
         # 11. Delete old S3 images after successful save
