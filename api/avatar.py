@@ -8,6 +8,8 @@ from core.storage.supabase_client import supabase
 from core.storage.s3 import storage
 from pipelines.avatar_pipeline import run_avatar_pipeline
 from shared.dependencies import get_current_user_id
+from shared.models.avatar_asset import AvatarAsset
+from workers.avatar.asset_builder import build_avatar_asset
 
 
 logger = get_logger(__name__)
@@ -105,3 +107,9 @@ async def delete_avatar(user_id: UUID = Depends(get_current_user_id)):
                 logger.warning(f"Failed to delete S3 image: {key}")
 
     return SuccessResponse(data={"message": "Avatar deleted successfully"})
+
+@router.get("/asset")
+async def get_avatar_asset(user_id: UUID = Depends(get_current_user_id)):
+    logger.info(f"Get avatar asset — user={user_id}")
+    asset = build_avatar_asset(str(user_id))
+    return SuccessResponse(data=asset)

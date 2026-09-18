@@ -176,7 +176,7 @@ def build_avatar_representation(avatar_user_id=AVATAR_USER_ID):
     from shared.exceptions import AvatarNotFoundError
 
     result = supabase.table("avatars")\
-        .select("processed_photo_url, pose_keypoints")\
+        .select("avatar_id, avatar_version, processed_photo_url, pose_keypoints")\
         .eq("user_id", str(avatar_user_id))\
         .maybe_single()\
         .execute()
@@ -185,7 +185,6 @@ def build_avatar_representation(avatar_user_id=AVATAR_USER_ID):
         raise AvatarNotFoundError()
 
     avatar_resp = result.data
-
     avatar_bytes = requests.get(avatar_resp["processed_photo_url"]).content
     image = Image.open(io.BytesIO(avatar_bytes)).convert("RGB")
 
@@ -204,7 +203,11 @@ def build_avatar_representation(avatar_user_id=AVATAR_USER_ID):
         "lower_legs": parsing_mask == LABEL_LOWER_LEGS,
     }
 
-    return AvatarRepresentation(image, body_part_masks, pose_keypoints)
+    rep = AvatarRepresentation(image, body_part_masks, pose_keypoints)
+    rep.avatar_id = avatar_resp["avatar_id"]
+    rep.avatar_version = avatar_resp["avatar_version"]
+    rep.processed_photo_url = avatar_resp["processed_photo_url"]
+    return rep
 
 
 if __name__ == "__main__":

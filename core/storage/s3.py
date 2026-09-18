@@ -10,6 +10,8 @@ class S3Folders:
     WARDROBE = settings.S3_WARDROBE_FOLDER
     OUTFITS = "outfits"
     TRYON = "tryons"
+    AVATAR_ASSETS = "avatar-assets"
+    GARMENT_ASSETS = "garment-assets"
     TEMP = "temp"
 
 class S3Storage:

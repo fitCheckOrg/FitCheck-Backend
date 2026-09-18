@@ -14,6 +14,9 @@ from shared.dependencies import get_current_user_id
 from shared.models.clothing import ClothingItem
 from core.constants.wardrobe_select import WARDROBE_ITEM_SELECT
 
+from shared.models.garment_asset import GarmentAsset
+from workers.wardrobe.asset_builder import build_garment_asset
+
 logger = get_logger(__name__)
 
 router = APIRouter(prefix="/wardrobe", tags=["Wardrobe"])
@@ -278,3 +281,9 @@ async def toggle_archive(item_id: UUID, user_id: UUID = Depends(get_current_user
         .execute()
 
     return SuccessResponse(data={"item_id": str(item_id), "is_archived": new_status})
+
+@router.get("/{item_id}/asset")
+async def get_garment_asset(item_id: UUID, user_id: UUID = Depends(get_current_user_id)):
+    logger.info(f"Get garment asset — item={item_id} user={user_id}")
+    asset = build_garment_asset(str(item_id), str(user_id))
+    return SuccessResponse(data=asset)
