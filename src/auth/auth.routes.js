@@ -16,6 +16,8 @@ authRouter.post("/login", authLimiter, authController.login);
 authRouter.post("/refresh", authController.refresh);
 authRouter.post("/forgot-password", authLimiter, authController.forgotPassword);
 authRouter.post("/reset-password", authController.resetPassword);
+// auth.routes.js
+authRouter.post("/verify-reset-otp", authLimiter, authController.verifyOtp);
 authRouter.post("/google", authLimiter, authController.googleLogin);
 
 // protected routes 

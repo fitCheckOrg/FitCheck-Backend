@@ -212,6 +212,19 @@ export const deleteProfile = async (userId, token) => {
 
 }
 
+export const verifyResetOtp = async (email, token) => {
+  const { data, error } = await supabase.auth.verifyOtp({
+    email,
+    token,
+    type: 'recovery'
+  })
+  if (error) throw new Error('Invalid or expired code. Please try again.')
+  return {
+    access_token: data.session.access_token,
+    refresh_token: data.session.refresh_token
+  }
+}
+
 const authService = {
     signUpUser,
     loginUser,
@@ -221,6 +234,7 @@ const authService = {
     logoutUser,
     getProfile,
     deleteProfile,
-    googleLogin
+    googleLogin,
+    verifyResetOtp
 }
 export default authService; 

@@ -1,5 +1,4 @@
 import authService, {
-  getProfile,
   logoutUser,
   signUpUser,
   refreshToken,
@@ -8,6 +7,7 @@ import authService, {
   deleteProfile,
 } from "./auth.service.js";
 import authValidation, { validateSignUp, validateResetPassword } from "./auth.validation.js";
+import { sendUnavailable } from "../middleware/authenticate.js";
 
 export const signUp = async (req, res) => {
   try {
@@ -111,13 +111,18 @@ export const logout = async (req, res) => {
   }
 };
 
+// Profile is already loaded (and cached) by the authenticate middleware,
+// so /auth/me makes no extra database call.
+//   503 PROFILE_UNAVAILABLE -> database/network problem, retry (do NOT log out)
+//   404 PROFILE_NOT_FOUND   -> valid user, no profiles row
 export const getMe = async (req, res) => {
-  try {
-    const profile = await getProfile(req.user.id);
-    res.json({ user: profile });
-  } catch (error) {
-    res.status(400).json({ error: error.message });
+  if (req.profileUnavailable) {
+    return sendUnavailable(res, 'PROFILE_UNAVAILABLE', 'Profile temporarily unavailable, please retry');
   }
+  if (!req.profile) {
+    return res.status(404).json({ error: 'Profile not found', code: 'PROFILE_NOT_FOUND' });
+  }
+  res.json({ user: req.profile });
 };
 
 export const deleteAccount = async (req, res) => {
@@ -155,6 +160,17 @@ export const googleLogin = async (req, res) => {
   }
 };
 
+// auth.controller.js
+export const verifyOtp = async (req, res) => {
+  try {
+    const { email, token } = req.body
+    const tokens = await authService.verifyResetOtp(email, token)
+    res.json({ message: 'Code verified', ...tokens })
+  } catch (error) {
+    res.status(400).json({ error: error.message })
+  }
+}
+
 const authController = {
   signUp,
   login,
@@ -165,5 +181,6 @@ const authController = {
   logout,
   getMe,
   deleteAccount,
+  verifyOtp
 };
 export default authController;
