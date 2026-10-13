@@ -1,15 +1,21 @@
 """
-Try-On API — V1.
+Try-On API — V2.
 
 Thin route. All real work lives in pipelines/tryon_pipeline.py.
-No database persistence, no history, no queue — matches the
-explicitly scoped V1 boundary.
+
+POST /api/tryon   body {"garment_id": uuid}
+  200  {"success": true, "data": {"status": "completed", "url", "key", "cached"}}
+  202  {"success": true, "data": {"status": "processing"}}
+       -> another request is already rendering this pair; retry in ~3 s
+  404  avatar / garment not found
+  409  GARMENT_UNSUPPORTED   (shoes, bags, accessories, unknown category)
+  502  TRYON_RENDER_ERROR    (model provider failed; next POST retries)
 """
 
 import logging
 from uuid import UUID
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, Response
 from pydantic import BaseModel
 
 from shared.dependencies import get_current_user_id
@@ -30,12 +36,13 @@ class TryOnRequest(BaseModel):
 
 @router.get("/health")
 async def health():
-    return {"service": "tryon", "version": "1.0.0", "status": "healthy"}
+    return {"service": "tryon", "version": "2.0.0", "status": "healthy"}
 
 
 @router.post("")
 async def try_on(
     body: TryOnRequest,
+    response: Response,
     user_id: UUID = Depends(get_current_user_id),
 ):
     logger.info("Try-on request — user=%s garment=%s", user_id, body.garment_id)
@@ -44,5 +51,8 @@ async def try_on(
         garment_id=body.garment_id,
         user_id=user_id,
     )
+
+    if result.get("status") == "processing":
+        response.status_code = 202
 
     return SuccessResponse(data=result)

@@ -5,7 +5,6 @@ import uuid
 from shared.models.enums import (
     Category, Pattern, Style, Season, Occasion
 )
-
 class ClothingItem(BaseModel):
     item_id: UUID4 = Field(default_factory=uuid.uuid4)
     user_id: UUID4
@@ -35,9 +34,11 @@ class ClothingItem(BaseModel):
     last_worn: datetime | None = None
     is_archived: bool = False
     created_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
+    asset_revision: str | None = None
 
     class Config:
         json_encoders = { uuid.UUID: str }
+        
 class ClothingClassification(BaseModel):
     category: Category
     item_type: str

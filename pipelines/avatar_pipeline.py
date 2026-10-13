@@ -10,6 +10,7 @@ from workers.avatar.analyzer import analyze_body
 from workers.avatar.generator import build_avatar_profile
 from workers.avatar.saver import save_avatar
 from workers.avatar.pose_estimator import estimate_pose
+from tryon.underarm_upload_check import check_avatar_photo
 
 logger = get_logger(__name__)
 
@@ -21,10 +22,10 @@ async def run_avatar_pipeline(
     """
     Full avatar processing pipeline.
 
-    Validate → Remove BG → Enhance → Analyze →
-    Upload Images → Build Profile → Save → Cleanup old
+    Validate -> Remove BG -> Enhance -> Analyze -> Pose -> Underarm check ->
+    Upload Images -> Build Profile -> Save -> Cleanup old
 
-    One avatar per user — upserts on conflict.
+    One avatar per user - upserts on conflict.
     Rollback: deletes new S3 images if save fails.
     """
 
@@ -34,29 +35,29 @@ async def run_avatar_pipeline(
     old_processed_url: str | None = None
 
     try:
-        logger.info("Avatar pipeline started — user=%s", user_id)
+        logger.info("Avatar pipeline started - user=%s", user_id)
 
         # 1. Read image
         image_bytes = await file.read()
         content_type = file.content_type
 
-        # 2. Validate — returns PIL Image so we don't decode twice
+        # 2. Validate - returns PIL Image so we don't decode twice
         validated_image = validate_image(image_bytes, content_type)
         photo_width, photo_height = validated_image.size
-        logger.info("Step 1/7 — Validation passed %dx%d", photo_width, photo_height)
+        logger.info("Step 1/7 - Validation passed %dx%d", photo_width, photo_height)
 
-        # 3. Get existing avatar — version + old S3 URLs for cleanup
+        # 3. Get existing avatar - version + old S3 URLs for cleanup
         existing_version, old_original_url, old_processed_url = _get_existing_avatar(user_id)
 
         # 4. Remove background
         processed_bytes = remove_background(image_bytes)
-        logger.info("Step 2/7 — Background removed")
+        logger.info("Step 2/7 - Background removed")
 
         # 5. Enhance
         enhanced_bytes = enhance_image(processed_bytes)
-        logger.info("Step 3/7 — Image enhanced")
+        logger.info("Step 3/7 - Image enhanced")
 
-        # Capture ACTUAL final dimensions — after crop, after enhance —
+        # Capture ACTUAL final dimensions - after crop, after enhance -
         # not the original pre-crop dimensions. remove.bg's crop=true
         # (added for wardrobe, shared by this pipeline) changes both
         # size AND aspect ratio, so this can't be assumed to match
@@ -67,26 +68,35 @@ async def run_avatar_pipeline(
         photo_width, photo_height = final_image.size
         logger.info("Actual processed dimensions: %dx%d", photo_width, photo_height)
 
-        # 6. Analyze body BEFORE uploading — avoid S3 cost if GPT fails
+        # 6. Analyze body BEFORE uploading - avoid S3 cost if GPT fails
         body_profile, body_profile_ai, orientation, accuracy = analyze_body(enhanced_bytes, "image/png")
         body_profile_ai["detected_orientation"] = orientation
         body_profile_ai["photo_accuracy"] = accuracy
-        logger.info("Step 4/7 — Body analysis complete")
+        logger.info("Step 4/7 - Body analysis complete")
 
-        # 4b. Estimate pose keypoints on the FINAL PROCESSED photo —
+        # 4b. Estimate pose keypoints on the FINAL PROCESSED photo -
         # must match the coordinate system of processed_photo_url,
         # which is what pose_keypoints will be applied against
         # downstream. Previously ran on image_bytes (the ORIGINAL,
         # pre-crop upload) while processed_photo_url stores the
-        # POST-crop image — a real aspect-ratio mismatch (confirmed
+        # POST-crop image - a real aspect-ratio mismatch (confirmed
         # via direct measurement: 0.5627 vs 0.3314, 41.1% difference)
         # that silently corrupted every downstream landmark
         # calculation using these normalized coordinates.
         pose_keypoints = estimate_pose(enhanced_bytes)
         if pose_keypoints:
-            logger.info("Step 4b/7 — Pose keypoints detected")
+            logger.info("Step 4b/7 - Pose keypoints detected")
         else:
-            logger.warning("Step 4b/7 — Pose keypoints not detected, continuing without them")
+            logger.warning("Step 4b/7 - Pose keypoints not detected, continuing without them")
+
+        # 4c. Underarm check on the FINAL processed photo and its keypoints,
+        # BEFORE any S3 upload: a photo that needs retaking costs nothing to
+        # reject (nothing to roll back) and the user's existing avatar is
+        # untouched (the save is the last step). Mode comes from
+        # UNDERARM_GATE_MODE: off | shadow (default, logs only) | enforce
+        # (raises 422 UNDERARM_NOT_DETECTED). The check fails open: if it
+        # cannot run, the upload proceeds.
+        check_avatar_photo(enhanced_bytes, pose_keypoints, user_id=user_id)
 
         # 7. Upload original to S3
         original_result = storage.upload(
@@ -96,7 +106,7 @@ async def run_avatar_pipeline(
             content_type=content_type
         )
         original_key = original_result["key"]
-        logger.info("Step 5/7 — Original uploaded to S3")
+        logger.info("Step 5/7 - Original uploaded to S3")
 
         # 8. Upload processed to S3
         processed_result = storage.upload(
@@ -106,7 +116,7 @@ async def run_avatar_pipeline(
             content_type="image/png"
         )
         processed_key = processed_result["key"]
-        logger.info("Step 6/7 — Processed uploaded to S3")
+        logger.info("Step 6/7 - Processed uploaded to S3")
 
         # 9. Build AvatarProfile
         profile = build_avatar_profile(
@@ -125,13 +135,13 @@ async def run_avatar_pipeline(
             photo_height=photo_height,
             pose_keypoints=pose_keypoints
         )
-        logger.info("Step 7/7 — Avatar saved to database")
+        logger.info("Step 7/7 - Avatar saved to database")
 
         # 11. Delete old S3 images after successful save
         _cleanup_old_images(old_original_url, old_processed_url)
 
         logger.info(
-            "Avatar pipeline complete — user=%s version=%d shape=%s",
+            "Avatar pipeline complete - user=%s version=%d shape=%s",
             user_id,
             profile.avatar_version,
             body_profile.body_shape.value
@@ -140,7 +150,11 @@ async def run_avatar_pipeline(
         return saved_avatar
 
     except Exception as e:
-        logger.exception("Avatar pipeline failed")
+        if getattr(e, "code", None) == "UNDERARM_NOT_DETECTED":
+            # Expected outcome (the photo needs retaking), not a pipeline crash.
+            logger.warning("Avatar pipeline stopped - photo needs retaking - user=%s", user_id)
+        else:
+            logger.exception("Avatar pipeline failed")
         _rollback(original_key, processed_key)
         raise
 
@@ -191,8 +205,8 @@ def _rollback(
     """Delete uploaded S3 images if pipeline fails."""
     if original_key:
         deleted = storage.delete(original_key)
-        logger.info("Rollback — original deleted: %s", deleted)
+        logger.info("Rollback - original deleted: %s", deleted)
 
     if processed_key:
         deleted = storage.delete(processed_key)
-        logger.info("Rollback — processed deleted: %s", deleted)
+        logger.info("Rollback - processed deleted: %s", deleted)

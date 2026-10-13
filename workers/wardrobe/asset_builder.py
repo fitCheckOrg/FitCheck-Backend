@@ -58,7 +58,13 @@ def build_garment_asset(item_id: str, user_id: str) -> GarmentAsset:
     w, h = image.size
 
     left_ua, right_ua = find_garment_underarms(mask, w)
-    left_sh, right_sh = get_garment_shoulder_points(mask, image, left_ua, right_ua, w)
+    try:
+        left_sh, right_sh = get_garment_shoulder_points(mask, image, left_ua, right_ua, w)
+    except Exception:
+        # Any detection failure (including the untested reference_angle=None
+        # crash path) degrades to "shoulders unavailable" — never a broken
+        # asset. This is the whole point of capabilities.shoulders.
+        left_sh, right_sh = None, None
 
     # CONFIRMED normalization rule (7/7 regression-validated):
     # image-space small-x -> anatomical RIGHT, large-x -> anatomical LEFT

@@ -12,13 +12,17 @@ Run standalone: python -m tryon.avatar_representation
 (fetches the golden avatar and prints a sanity summary)
 """
 
+import functools
 import io
+import logging
 import numpy as np
 import requests
 from PIL import Image
 import onnxruntime as ort
 from huggingface_hub import hf_hub_download
 from transformers import AutoImageProcessor
+
+logger = logging.getLogger(__name__)
 
 AVATAR_USER_ID = "15bacab3-5873-401b-9c9a-52f8b3eeeaf7"
 SCHP_MODEL_ID = "pirocheto/schp-pascal-7"
@@ -123,32 +127,96 @@ class AvatarRepresentation:
             self._compute_underarms()
         return self._right_underarm
 
-    def _compute_underarms(self):
+    @property
+    def underarm_result(self):
+        """The UnderarmLandmarkResult (see resolve_underarms)."""
+        return self.resolve_underarms()
+
+    def resolve_underarms(self):
+        """
+        Resolve the underarm landmarks once and return the full
+        UnderarmLandmarkResult: per-landmark source, both estimates, method
+        and landmark revision. Never raises for bad data - an unresolvable
+        photo comes back as an UNRESOLVED result. (left_underarm and
+        right_underarm still raise the 422 for that case.)
+        """
+        if not hasattr(self, "_underarm_result"):
+            from tryon.underarm_landmark_resolver import resolve_underarm_landmarks
+            self._underarm_result = resolve_underarm_landmarks(
+                self.image,
+                self.left_shoulder,
+                self.right_shoulder,
+                detector_left=self._detector_underarm("left"),
+                detector_right=self._detector_underarm("right"),
+            )
+        return self._underarm_result
+
+    def _detector_underarm(self, side):
+        """
+        Mask-based detector underarm for one side as (x, y), or None.
+        A missing row or an empty mask row means "no detector estimate for
+        this side"; so does an error raised while running the detector, which
+        is logged rather than swallowed. The x rule is the one
+        _compute_underarms always used (outer edge of the torso mask on that
+        row, within that image half).
+        """
+        # Import outside the try: a broken/missing detector module is a
+        # deployment bug and must fail loudly, not silently fall back.
         from tryon.avatar_torso_landmarks_test import find_semantic_underarm
-        aw = self.image.size[0]
+        try:
+            aw = self.image.size[0]
+            found = find_semantic_underarm(self.torso_mask, self.upper_arms_mask, aw, side)
+            row = found[0] if found else None
+            if row is None:
+                return None
+            row = int(row)
+            if not 0 <= row < self.torso_mask.shape[0]:
+                return None
+            if side == "left":
+                xs = np.where(self.torso_mask[row][:aw // 2])[0]
+                return (int(xs.min()), row) if xs.size else None
+            xs = np.where(self.torso_mask[row][aw // 2:])[0] + aw // 2
+            return (int(xs.max()), row) if xs.size else None
+        except Exception:
+            logger.exception("underarm detector failed (%s side); treating as no estimate", side)
+            return None
 
-        a_l_uy, _ = find_semantic_underarm(self.torso_mask, self.upper_arms_mask, aw, "left")
-        a_l_row = self.torso_mask[a_l_uy]
-        a_l_xs = np.where(a_l_row[:aw // 2])[0]
-        self._left_underarm = (int(a_l_xs.min()), a_l_uy)
+    def _compute_underarms(self):
+        from shared.exceptions import FitCheckException
 
-        a_r_uy, _ = find_semantic_underarm(self.torso_mask, self.upper_arms_mask, aw, "right")
-        a_r_row = self.torso_mask[a_r_uy]
-        a_r_xs = np.where(a_r_row[aw // 2:])[0] + aw // 2
-        self._right_underarm = (int(a_r_xs.max()), a_r_uy)
+        result = self.resolve_underarms()
+        if not result.resolved:
+            raise FitCheckException(
+                "Could not locate the underarm points on this avatar photo.",
+                code="UNDERARM_NOT_DETECTED",
+                status_code=422,
+            )
+        # Same (int x, int y) tuples the rest of the pipeline already consumes.
+        self._left_underarm = (int(round(result.left.x)), int(round(result.left.y)))
+        self._right_underarm = (int(round(result.right.x)), int(round(result.right.y)))
 
 
-def _run_schp_segmentation(pil_image):
+@functools.lru_cache(maxsize=1)
+def _load_schp():
     """
-    Exactly the inference path validated in human_parsing_test.py —
-    ONNX, no torch/schp package, no compiler dependency.
+    Load the SCHP processor and ONNX session once per process and reuse them.
+    (Previously every segmentation call re-read the model from disk, which is
+    fine for a script and too slow for an upload endpoint.) Failures are not
+    cached: a failed load is retried on the next call.
     """
     onnx_path = hf_hub_download(repo_id=SCHP_MODEL_ID, filename="onnx/schp-pascal-7.onnx")
     hf_hub_download(repo_id=SCHP_MODEL_ID, filename="onnx/schp-pascal-7.onnx.data")
     processor = AutoImageProcessor.from_pretrained(SCHP_MODEL_ID, trust_remote_code=True)
-
     session = ort.InferenceSession(onnx_path, providers=["CPUExecutionProvider"])
-    input_name = session.get_inputs()[0].name
+    return processor, session, session.get_inputs()[0].name
+
+
+def _run_schp_segmentation(pil_image):
+    """
+    Exactly the inference path validated in human_parsing_test.py -
+    ONNX, no torch/schp package, no compiler dependency.
+    """
+    processor, session, input_name = _load_schp()
 
     aw, ah = pil_image.size
     inputs = processor(images=pil_image, return_tensors="np")
@@ -166,10 +234,34 @@ def _run_schp_segmentation(pil_image):
     return parsing_mask
 
 
+def build_avatar_representation_from_image(image, pose_keypoints):
+    """
+    Build a real AvatarRepresentation from an RGB PIL image and its pose
+    keypoints, both already in memory (no database or network access).
+    This is the segmentation half of build_avatar_representation, split out
+    so the upload pipeline can run the same check on the photo it just
+    processed. Raises ValueError if pose_keypoints are missing.
+    """
+    if not pose_keypoints:
+        raise ValueError("No pose_keypoints available for this avatar - cannot build representation.")
+
+    parsing_mask = _run_schp_segmentation(image)
+
+    body_part_masks = {
+        "head": parsing_mask == LABEL_HEAD,
+        "torso": parsing_mask == LABEL_TORSO,
+        "upper_arms": parsing_mask == LABEL_UPPER_ARMS,
+        "lower_arms": parsing_mask == LABEL_LOWER_ARMS,
+        "upper_legs": parsing_mask == LABEL_UPPER_LEGS,
+        "lower_legs": parsing_mask == LABEL_LOWER_LEGS,
+    }
+    return AvatarRepresentation(image, body_part_masks, pose_keypoints)
+
+
 def build_avatar_representation(avatar_user_id=AVATAR_USER_ID):
     """
     Fetches the current avatar, runs SCHP, and returns a real
-    AvatarRepresentation. No fallbacks, no synthetic geometry — if
+    AvatarRepresentation. No fallbacks, no synthetic geometry - if
     pose_keypoints are missing, this will raise rather than guess.
     """
     from core.storage.supabase_client import supabase
@@ -188,22 +280,7 @@ def build_avatar_representation(avatar_user_id=AVATAR_USER_ID):
     avatar_bytes = requests.get(avatar_resp["processed_photo_url"]).content
     image = Image.open(io.BytesIO(avatar_bytes)).convert("RGB")
 
-    pose_keypoints = avatar_resp["pose_keypoints"]
-    if not pose_keypoints:
-        raise ValueError("No pose_keypoints available for this avatar — cannot build representation.")
-
-    parsing_mask = _run_schp_segmentation(image)
-
-    body_part_masks = {
-        "head": parsing_mask == LABEL_HEAD,
-        "torso": parsing_mask == LABEL_TORSO,
-        "upper_arms": parsing_mask == LABEL_UPPER_ARMS,
-        "lower_arms": parsing_mask == LABEL_LOWER_ARMS,
-        "upper_legs": parsing_mask == LABEL_UPPER_LEGS,
-        "lower_legs": parsing_mask == LABEL_LOWER_LEGS,
-    }
-
-    rep = AvatarRepresentation(image, body_part_masks, pose_keypoints)
+    rep = build_avatar_representation_from_image(image, avatar_resp["pose_keypoints"])
     rep.avatar_id = avatar_resp["avatar_id"]
     rep.avatar_version = avatar_resp["avatar_version"]
     rep.processed_photo_url = avatar_resp["processed_photo_url"]
@@ -220,4 +297,4 @@ if __name__ == "__main__":
     print(f"Right shoulder (px): {rep.right_shoulder}")
     print(f"Left hip (px): {rep.left_hip}")
     print(f"Right hip (px): {rep.right_hip}")
-    print("\n>>> AvatarRepresentation built successfully — masks and keypoints held together, no inferred geometry.")
+    print("\n>>> AvatarRepresentation built successfully - masks and keypoints held together, no inferred geometry.")

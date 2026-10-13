@@ -1,0 +1,174 @@
+{
+ "label": "f4b5f129",
+ "user_id": "f4b5f129-db34-40e5-8423-d1b256a15578",
+ "avatar_id": "5147b081-da6b-4dff-8698-0b3541e0640e",
+ "avatar_version": "1",
+ "shoulders": [
+  [
+   31.9455,
+   122.202
+  ],
+  [
+   128.10750000000002,
+   124.0992
+  ]
+ ],
+ "x_c": 80.02650000000001,
+ "y_sh": 123.1506,
+ "span": 96.1807133049033,
+ "foreground": {
+  "size": [
+   155,
+   558
+  ],
+  "source": "non-black pixels (NO usable alpha)",
+  "area": 46229,
+  "area_frac": 0.5345010983928777,
+  "mean_lum": 105.1423159704947,
+  "near_black_frac": 0.019014038806809578,
+  "contrast_vs_black": 105.1423159704947,
+  "contrast_vs_white": 149.8576840295053,
+  "alt_area_ratio": 1.010101884098726,
+  "components": 1,
+  "largest_frac": 1.0,
+  "holes_frac": 0.03502130697181423,
+  "hull_gap_frac": 0.2366035305579867,
+  "band_main_frac": 1.0,
+  "centreline_missing": 0.0,
+  "band": [
+   123,
+   228
+  ],
+  "holes_central_frac": 0.0,
+  "fg_intact": true
+ },
+ "masks": {
+  "torso_area": 2502,
+  "arms_area": 2800,
+  "torso_frac_of_fg": 0.054121871552488696,
+  "arms_frac_of_fg": 0.060568041705423,
+  "central_fg_px": 5194,
+  "uncovered_frac": 0.9187524066230266,
+  "uncovered_bbox": [
+   56,
+   123,
+   104,
+   228
+  ],
+  "mask_hole": true
+ },
+ "verdict": "MASK FAILURE (SCHP): foreground intact, masks leave a hole - the pipeline detector fails, the silhouette apex is valid",
+ "detector_raw": {
+  "left": "(170, [106, 107, 108, 109, 110, 111, 112, 113, 114, 115, 116, 117, 118, 119, 120, 121, 122, 123, 124, 125, 126, 127, 128, 129, 130, 131, 132, 133, 134, 135, 136...(truncated)",
+  "right": "(None, [])"
+ },
+ "detector": {
+  "left": {
+   "y": 170.0,
+   "x": null,
+   "rows": [
+    106,
+    170,
+    65
+   ]
+  },
+  "right": null
+ },
+ "detector_marks": [
+  [
+   "left",
+   {
+    "y": 170.0,
+    "x": null,
+    "rows": [
+     106,
+     170,
+     65
+    ]
+   }
+  ]
+ ],
+ "pipeline_underarms": [
+  null,
+  null
+ ],
+ "apex": {
+  "apex": {
+   "small-x": [
+    33.0,
+    147.0
+   ],
+   "large-x": [
+    120.0,
+    151.0
+   ]
+  },
+  "persist": {
+   "small-x": 78,
+   "large-x": 72
+  },
+  "axis": [
+   -1.4644688775986203,
+   61,
+   0.4434401336725652
+  ],
+  "min_run": 3,
+  "scan": [
+   123,
+   228
+  ],
+  "depth": {
+   "small-x": 0.2479644741705628,
+   "large-x": 0.2895528536133266
+  },
+  "plausible": true
+ },
+ "apex_line_deg": 2.632434868986484,
+ "A3": {
+  "detector:small-x": "y 170 vs apex (33.0, 147): dy +23.0px  (row only) -> DISAGREES",
+  "detector:large-x": "DETECTOR FAILED (None) - no landmark to compare"
+ },
+ "A5": {
+  "moved": [
+   26.0,
+   17.0
+  ],
+  "stable": false,
+  "lost_band_px": 71
+ },
+ "apex_lowthr": {
+  "apex": {
+   "small-x": [
+    37.0,
+    173.0
+   ],
+   "large-x": [
+    117.0,
+    168.0
+   ]
+  },
+  "persist": {
+   "small-x": 55,
+   "large-x": 61
+  },
+  "axis": [
+   -2.0764667161151946,
+   48,
+   0.40328882221744844
+  ],
+  "min_run": 3,
+  "scan": [
+   123,
+   228
+  ],
+  "depth": {
+   "small-x": 0.5182889405485276,
+   "large-x": 0.4663034662450728
+  },
+  "plausible": true
+ },
+ "apex_line_deg_lowthr": -3.576334374997351,
+ "recommended_apex": "low-threshold (sum>6)",
+ "c2_usable_with_lowthr_apex": true,
+ "c2_usable": false
+}

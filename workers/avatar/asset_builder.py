@@ -36,15 +36,24 @@ def _normalize(pt: tuple[int, int], width: int, height: int) -> NormalizedPoint:
     )
 
 
+def _canonical_pair(a, b):
+    """Front-facing avatar: anatomical LEFT = image RIGHT (larger x).
+    Returns (left, right)."""
+    return (a, b) if a[0] >= b[0] else (b, a)
+
+
 def build_avatar_asset(user_id: str) -> AvatarAsset:
     rep = build_avatar_representation(user_id)
     width, height = rep.image.size
 
+    left_shoulder, right_shoulder = _canonical_pair(rep.left_shoulder, rep.right_shoulder)
+    left_underarm, right_underarm = _canonical_pair(rep.left_underarm, rep.right_underarm)
+
     landmarks = AvatarAssetLandmarks(
-        left_shoulder=_normalize(rep.left_shoulder, width, height),
-        right_shoulder=_normalize(rep.right_shoulder, width, height),
-        left_underarm=_normalize(rep.left_underarm, width, height),
-        right_underarm=_normalize(rep.right_underarm, width, height),
+        left_shoulder=_normalize(left_shoulder, width, height),
+        right_shoulder=_normalize(right_shoulder, width, height),
+        left_underarm=_normalize(left_underarm, width, height),
+        right_underarm=_normalize(right_underarm, width, height),
     )
 
     torso_bytes = _mask_to_png_bytes(rep.torso_mask)

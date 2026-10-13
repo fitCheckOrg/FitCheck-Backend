@@ -135,8 +135,12 @@ async def get_wardrobe_item(item_id: UUID, user_id: UUID = Depends(get_current_u
     if not result or not result.data:
         raise ClothingItemNotFoundError()
 
-    item = ClothingItem(**result.data).model_dump(mode="json")
-    return SuccessResponse(data=item)
+    row = dict(result.data)
+    image_hash = row.pop("image_hash", None)
+    item = ClothingItem(**row)
+    item_dict = item.model_dump(mode="json")
+    item_dict["asset_revision"] = f"md5:{image_hash}" if image_hash else None
+    return SuccessResponse(data=item_dict)
 
 @router.patch("/{item_id}", response_model=SuccessResponse)
 async def update_wardrobe_item(
