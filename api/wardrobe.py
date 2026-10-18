@@ -28,36 +28,46 @@ class UpdateClothingItemRequest(BaseModel):
     item_type: str | None = None
 
 
-# ── Fixed routes first (before dynamic /{item_id}) ────────────────
+# -- Fixed routes first (before dynamic /{item_id}) ---------------------------
 
 @router.get("/health")
 async def health():
-    return { "service": "wardrobe", "version": "1.0.0", "status": "healthy" }
+    return { "service": "wardrobe", "version": "1.1.0", "status": "healthy" }
 
 
 @router.get("/stats/summary", response_model=SuccessResponse)
 async def get_wardrobe_stats(user_id: UUID = Depends(get_current_user_id)):
-    """Get closet stats — count by category"""
+    """
+    Closet stats.
+      total, by_category -> ACTIVE items only (archived excluded)
+      archived_count     -> number of archived items
+    """
     logger.info(f"Get stats user={user_id}")
 
     result = supabase.table("closet_items")\
-        .select("category")\
+        .select("category, is_archived")\
         .eq("user_id", str(user_id))\
-        .eq("is_archived", False)\
         .execute()
 
     counts = {}
-    for item in result.data:
+    active_total = 0
+    archived_count = 0
+    for item in result.data or []:
+        if item.get("is_archived"):
+            archived_count += 1
+            continue
+        active_total += 1
         cat = item["category"]
         counts[cat] = counts.get(cat, 0) + 1
 
     return SuccessResponse(data={
-        "total": len(result.data),
-        "by_category": counts
+        "total": active_total,
+        "by_category": counts,
+        "archived_count": archived_count
     })
 
 
-# ── Collection routes ─────────────────────────────────────────────
+# -- Collection routes --------------------------------------------------------
 
 @router.post("/upload", response_model=SuccessResponse)
 async def upload_clothing_item(
@@ -76,13 +86,26 @@ async def get_wardrobe(
     category: Optional[Category] = Query(None),
     search: Optional[str] = Query(None),
     favorites_only: bool = Query(False),
+    archived: Optional[bool] = Query(None),
     include_archived: bool = Query(False),
     limit: int = Query(20, ge=1, le=100),
     offset: int = Query(0, ge=0),
     sort: str = Query("newest")
 ):
-    """Get all closet items for a user"""
-    logger.info(f"Get wardrobe user={user_id} category={category} search={search}")
+    """
+    Get closet items for a user.
+
+    Archive filter:
+      archived=true   -> archived items only
+      archived=false  -> active items only
+      (not sent)      -> legacy: include_archived=false (default) -> active only,
+                         include_archived=true -> active + archived
+      If both are sent, `archived` wins.
+    """
+    logger.info(
+        f"Get wardrobe user={user_id} category={category} search={search} "
+        f"archived={archived} include_archived={include_archived}"
+    )
 
     query = supabase.table("closet_items")\
     .select(WARDROBE_ITEM_SELECT, count="exact")\
@@ -92,8 +115,12 @@ async def get_wardrobe(
         query = query.eq("category", category.value)
     if favorites_only:
         query = query.eq("favorite", True)
-    if not include_archived:
+
+    if archived is not None:
+        query = query.eq("is_archived", archived)
+    elif not include_archived:
         query = query.eq("is_archived", False)
+
     if search:
         query = query.ilike("search_text", f"%{search}%")
 
@@ -121,7 +148,7 @@ async def get_wardrobe(
     })
 
 
-# ── Item routes ──────────
+# -- Item routes --------------------------------------------------------------
 
 @router.get("/{item_id}", response_model=SuccessResponse)
 async def get_wardrobe_item(item_id: UUID, user_id: UUID = Depends(get_current_user_id)):
@@ -164,7 +191,7 @@ async def update_wardrobe_item(
         .eq("item_id", str(item_id))\
         .eq("user_id", str(user_id))\
         .execute()
-    
+
     if not result.data:
         raise ClothingItemNotFoundError()
 
@@ -288,6 +315,6 @@ async def toggle_archive(item_id: UUID, user_id: UUID = Depends(get_current_user
 
 @router.get("/{item_id}/asset")
 async def get_garment_asset(item_id: UUID, user_id: UUID = Depends(get_current_user_id)):
-    logger.info(f"Get garment asset — item={item_id} user={user_id}")
+    logger.info(f"Get garment asset - item={item_id} user={user_id}")
     asset = build_garment_asset(str(item_id), str(user_id))
     return SuccessResponse(data=asset)
