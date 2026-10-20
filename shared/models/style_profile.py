@@ -4,7 +4,8 @@ from uuid import UUID
 
 
 class StyleProfile(BaseModel):
-    user_id: UUID
+    # Optional: the server always uses the user from the auth token.
+    user_id: UUID | None = None
     styles: list[str] = []
     preferred_colors: list[str] = []
     disliked_colors: list[str] = []

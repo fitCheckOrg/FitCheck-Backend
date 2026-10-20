@@ -6,7 +6,7 @@ from datetime import datetime, UTC
 from shared.logger import get_logger
 from shared.models.responses import SuccessResponse
 from shared.models.enums import OutfitOccasion, OutfitMood
-from pipelines.stylist_pipeline import run_stylist_pipeline
+from pipelines.stylist_pipeline import run_stylist_pipeline, run_swap_pipeline
 from pipelines.stylist_feedback_pipeline import record_feedback
 from workers.stylist.intent_extractor import extract_intent
 
@@ -22,12 +22,24 @@ class GenerateRequest(BaseModel):
     latitude: float | None = None
     longitude: float | None = None
     excluded_item_ids: list[UUID] = Field(default_factory=list)
+    exclude_outfit_keys: list[str] = Field(default_factory=list)
+    variation: int = Field(default=0, ge=0)
     max_results: int = 3
 
 class DressMeForThisRequest(BaseModel):
     text: str
     latitude: float | None = None
     longitude: float | None = None
+    excluded_item_ids: list[UUID] = Field(default_factory=list)
+    exclude_outfit_keys: list[str] = Field(default_factory=list)
+    variation: int = Field(default=0, ge=0)
+    max_results: int = 3
+
+class SwapRequest(BaseModel):
+    item_ids: list[UUID]
+    replace_item_id: UUID
+    occasion: OutfitOccasion = OutfitOccasion.EVERYDAY
+    mood: OutfitMood | None = None
     excluded_item_ids: list[UUID] = Field(default_factory=list)
     max_results: int = 3
 
@@ -42,7 +54,7 @@ class FeedbackRequest(BaseModel):
 
 @router.get("/health")
 async def health():
-    return { "service": "stylist", "version": "1.1.0", "status": "healthy" }
+    return { "service": "stylist", "version": "1.2.0", "status": "healthy" }
 
 
 @router.post("/generate", response_model=SuccessResponse)
@@ -54,8 +66,11 @@ async def generate_outfit_suggestions(
     Fast, instant outfit generation - no AI call.
     Returns top N scored candidates. Call POST /api/outfit/analyze
     separately on the chosen result for a rich AI critique.
+
+    Same request on the same day -> same outfits. For "Generate similar":
+    send variation = previous + 1 and exclude_outfit_keys = keys already shown.
     """
-    logger.info(f"Generate request - user={user_id} occasion={body.occasion}")
+    logger.info(f"Generate request - user={user_id} occasion={body.occasion} variation={body.variation}")
 
     outfits = await run_stylist_pipeline(
         user_id=str(user_id),
@@ -64,7 +79,9 @@ async def generate_outfit_suggestions(
         latitude=body.latitude,
         longitude=body.longitude,
         excluded_item_ids=[str(i) for i in body.excluded_item_ids],
-        max_results=body.max_results
+        max_results=body.max_results,
+        variation=body.variation,
+        excluded_outfit_keys=body.exclude_outfit_keys,
     )
 
     return SuccessResponse(data={
@@ -72,6 +89,7 @@ async def generate_outfit_suggestions(
         "generated_at": datetime.now(UTC).isoformat(),
         "occasion": body.occasion.value,
         "mood": body.mood.value if body.mood else None,
+        "variation": body.variation,
         "count": len(outfits)
     })
 
@@ -97,7 +115,9 @@ async def dress_me_for_this(
         latitude=body.latitude,
         longitude=body.longitude,
         excluded_item_ids=[str(i) for i in body.excluded_item_ids],
-        max_results=body.max_results
+        max_results=body.max_results,
+        variation=body.variation,
+        excluded_outfit_keys=body.exclude_outfit_keys,
     )
 
     return SuccessResponse(data={
@@ -106,8 +126,29 @@ async def dress_me_for_this(
         "interpreted_occasion": intent.occasion.value,
         "interpreted_mood": intent.mood.value if intent.mood else None,
         "interpretation_confidence": intent.confidence,
+        "variation": body.variation,
         "count": len(outfits)
     })
+
+@router.post("/swap", response_model=SuccessResponse)
+async def swap_one_piece(
+    body: SwapRequest,
+    user_id: UUID = Depends(get_current_user_id)
+):
+    """
+    Replace ONE item of an outfit. Returns up to 5 alternatives of the same
+    category from the user's active wardrobe, each as a re-scored outfit.
+    """
+    result = run_swap_pipeline(
+        user_id=str(user_id),
+        item_ids=[str(i) for i in body.item_ids],
+        replace_item_id=str(body.replace_item_id),
+        occasion=body.occasion.value,
+        mood=body.mood.value if body.mood else None,
+        excluded_item_ids=[str(i) for i in body.excluded_item_ids],
+        max_results=body.max_results,
+    )
+    return SuccessResponse(data=result)
 
 @router.post("/feedback", response_model=SuccessResponse)
 async def stylist_feedback(

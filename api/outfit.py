@@ -38,14 +38,45 @@ class SaveOutfitRequest(BaseModel):
     occasion: OutfitOccasion = OutfitOccasion.EVERYDAY
     name: str | None = None
     category: DiscoverCategory | None = None
-    
+
 class PublishOutfitRequest(BaseModel):
     is_public: bool
 
+
+# -- Optional personalisation inputs ------------------------------------------
+# A user who skipped onboarding (no style profile) or has no avatar must still
+# be able to analyze and save outfits. These never raise.
+
+def _style_profile_for(user_id: UUID) -> dict:
+    try:
+        res = supabase.table("style_profiles")\
+            .select("styles, preferred_colors, disliked_colors")\
+            .eq("user_id", str(user_id))\
+            .maybe_single()\
+            .execute()
+        return (res.data or {}) if res else {}
+    except Exception as exc:
+        logger.warning("Style profile unavailable for user=%s: %s", user_id, exc)
+        return {}
+
+
+def _body_profile_for(user_id: UUID) -> dict:
+    try:
+        res = supabase.table("avatars")\
+            .select("body_profile")\
+            .eq("user_id", str(user_id))\
+            .maybe_single()\
+            .execute()
+        return ((res.data or {}).get("body_profile") or {}) if res else {}
+    except Exception as exc:
+        logger.warning("Body profile unavailable for user=%s: %s", user_id, exc)
+        return {}
+
+
 @router.get("/health")
 async def health():
-    
-    return { "service": "outfit", "version": "1.0.0", "status": "healthy" }
+
+    return { "service": "outfit", "version": "1.1.0", "status": "healthy" }
 
 
 @router.post("/compatibility", response_model=SuccessResponse)
@@ -55,7 +86,7 @@ async def check_compatibility(
 ):
     """
     Instant rule-based compatibility check.
-    No AI call — called on every swipe/selection change.
+    No AI call - called on every swipe/selection change.
     """
     if len(body.item_ids) > MAX_OUTFIT_ITEMS:
         raise FitCheckException(
@@ -79,7 +110,7 @@ async def check_compatibility(
             "engine_version": "1.0"
         })
 
-    logger.info(f"Compatibility check — user={user_id} items={len(body.item_ids)}")
+    logger.info(f"Compatibility check - user={user_id} items={len(body.item_ids)}")
 
     ids = [str(i) for i in body.item_ids]
 
@@ -109,8 +140,9 @@ async def analyze_outfit_endpoint(
     user_id: UUID = Depends(get_current_user_id)
 ):
     """
-    Deep AI analysis — called after user pauses on an outfit.
-    Does NOT save anything. Uses style profile + avatar body profile.
+    Deep AI analysis - called after user pauses on an outfit.
+    Does NOT save anything. Uses style profile + avatar body profile
+    when they exist; works without them.
     """
     if len(body.item_ids) > MAX_OUTFIT_ITEMS:
         raise FitCheckException(
@@ -126,11 +158,11 @@ async def analyze_outfit_endpoint(
             status_code=400
         )
 
-    logger.info(f"Outfit analysis — user={user_id} items={len(body.item_ids)}")
+    logger.info(f"Outfit analysis - user={user_id} items={len(body.item_ids)}")
 
     ids = [str(i) for i in body.item_ids]
 
-    # Fetch items — richer field set for AI context
+    # Fetch items - richer field set for AI context
     items_result = supabase.table("closet_items")\
         .select("item_id, category, item_type, dominant_color, dominant_hex, "
                 "pattern, style, material, occasions, seasons")\
@@ -143,29 +175,13 @@ async def analyze_outfit_endpoint(
 
     items = items_result.data
     validate_outfit_composition(items)
-    # Rule-based scores first — feeds into the AI prompt
+    # Rule-based scores first - feeds into the AI prompt
     rule_scores = calculate_compatibility(items)
-
-    # Fetch style profile — default if not onboarded yet
-    style_result = supabase.table("style_profiles")\
-        .select("styles, preferred_colors, disliked_colors")\
-        .eq("user_id", str(user_id))\
-        .single()\
-        .execute()
-    style_profile = style_result.data or {}
-
-    # Fetch avatar body profile — default if no avatar yet
-    avatar_result = supabase.table("avatars")\
-        .select("body_profile")\
-        .eq("user_id", str(user_id))\
-        .single()\
-        .execute()
-    body_profile = (avatar_result.data or {}).get("body_profile") or {}
 
     ai_result = analyze_outfit(
         items=items,
-        style_profile=style_profile,
-        body_profile=body_profile,
+        style_profile=_style_profile_for(user_id),
+        body_profile=_body_profile_for(user_id),
         rule_scores=rule_scores,
         occasion=body.occasion.value
     )
@@ -191,7 +207,7 @@ async def save_outfit(
         )
 
     ids = [str(i) for i in body.item_ids]
-    logger.info(f"Save outfit — user={user_id} items={len(ids)}")
+    logger.info(f"Save outfit - user={user_id} items={len(ids)}")
 
     items_result = supabase.table("closet_items")\
         .select("item_id, category, item_type, dominant_color, dominant_hex, "
@@ -207,19 +223,9 @@ async def save_outfit(
     validate_outfit_composition(items)
     rule_scores = calculate_compatibility(items)
 
-    style_result = supabase.table("style_profiles")\
-        .select("styles, preferred_colors, disliked_colors")\
-        .eq("user_id", str(user_id)).single().execute()
-    style_profile = style_result.data or {}
-
-    avatar_result = supabase.table("avatars")\
-        .select("body_profile")\
-        .eq("user_id", str(user_id)).single().execute()
-    body_profile = (avatar_result.data or {}).get("body_profile") or {}
-
     ai_result = analyze_outfit(
-        items=items, style_profile=style_profile,
-        body_profile=body_profile, rule_scores=rule_scores,
+        items=items, style_profile=_style_profile_for(user_id),
+        body_profile=_body_profile_for(user_id), rule_scores=rule_scores,
         occasion=body.occasion.value
     )
 
@@ -249,7 +255,7 @@ async def save_outfit(
             "Failed to save outfit.", code="DATABASE_ERROR", status_code=500
         )
 
-    logger.info(f"Outfit saved — id={result.data[0]['outfit_id']}")
+    logger.info(f"Outfit saved - id={result.data[0]['outfit_id']}")
     return SuccessResponse(data=result.data[0])
 
 
@@ -260,7 +266,7 @@ async def get_outfits(
     offset: int = Query(0, ge=0)
 ):
     """List saved outfits for a user"""
-    logger.info(f"Get outfits — user={user_id}")
+    logger.info(f"Get outfits - user={user_id}")
 
     result = supabase.table("outfits")\
         .select("*", count="exact")\
@@ -281,7 +287,7 @@ async def get_outfits(
 @router.delete("/{outfit_id}", response_model=SuccessResponse)
 async def delete_outfit(outfit_id: UUID, user_id: UUID = Depends(get_current_user_id)):
     """Delete a saved outfit"""
-    logger.info(f"Delete outfit — id={outfit_id} user={user_id}")
+    logger.info(f"Delete outfit - id={outfit_id} user={user_id}")
 
     result = supabase.table("outfits")\
         .delete()\
@@ -304,11 +310,11 @@ async def create_planned_outfit(
 ):
     """
     Schedule an outfit for a specific date. Upserts on
-    (user_id, scheduled_date) — replanning a day overwrites
+    (user_id, scheduled_date) - replanning a day overwrites
     the previous entry rather than creating a duplicate.
     """
     logger.info(
-        f"Plan outfit — user={user_id} date={body.scheduled_date}"
+        f"Plan outfit - user={user_id} date={body.scheduled_date}"
     )
 
     ids = [str(i) for i in body.item_ids]
@@ -341,7 +347,7 @@ async def create_planned_outfit(
             "Failed to plan outfit.", code="DATABASE_ERROR", status_code=500
         )
 
-    logger.info(f"Outfit planned — date={body.scheduled_date}")
+    logger.info(f"Outfit planned - date={body.scheduled_date}")
     return SuccessResponse(data=result.data[0])
 
 
@@ -351,9 +357,9 @@ async def get_planned_outfits(
     start_date: date = Query(...),
     end_date: date = Query(...)
 ):
-    """Get planned outfits within a date range — e.g. one week."""
+    """Get planned outfits within a date range - e.g. one week."""
     logger.info(
-        f"Get planner — user={user_id} range={start_date} to {end_date}"
+        f"Get planner - user={user_id} range={start_date} to {end_date}"
     )
 
     result = supabase.table("planned_outfits")\
@@ -376,7 +382,7 @@ async def toggle_outfit_publish(
 ):
     """Publish or unpublish an outfit to the public Discover feed."""
     logger.info(
-        f"Toggle outfit publish — outfit={outfit_id} user={user_id} is_public={body.is_public}"
+        f"Toggle outfit publish - outfit={outfit_id} user={user_id} is_public={body.is_public}"
     )
 
     result = supabase.table("outfits")\
@@ -401,7 +407,7 @@ async def update_planned_outfit(
     body: UpdatePlannedOutfitRequest,
     user_id: UUID = Depends(get_current_user_id)
 ):
-    """Edit a planned outfit — change items, mark as worn/skipped, etc."""
+    """Edit a planned outfit - change items, mark as worn/skipped, etc."""
     updates = {}
     if body.item_ids is not None:
         updates["item_ids"] = [str(i) for i in body.item_ids]
