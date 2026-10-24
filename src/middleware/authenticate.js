@@ -12,6 +12,13 @@
 // 15 min. If it can't be loaded, the request is NOT rejected: req.user has
 // the token's identity, req.profileUnavailable = true, and only routes that
 // need the profile (requirePremium, /auth/me) answer 503.
+//
+// DEV ONLY (AUTH-20): with DEV_FAULT_INJECTION=true in .env and NODE_ENV not
+// "production", the request header
+//   X-Debug-Fail: auth     -> 503 AUTH_UNAVAILABLE      (any protected route)
+//   X-Debug-Fail: profile  -> profile treated as unavailable
+//                             -> /api/auth/me answers 503 PROFILE_UNAVAILABLE
+// Both carry Retry-After: 5. Without the env flag the header is ignored.
 
 import redis from "../config/redis.js";
 import supabase from "../config/supabase.js";
@@ -23,6 +30,9 @@ const REDIS_TIMEOUT_MS = 1500;
 const PROFILE_TIMEOUT_MS = 5000;
 
 const profileKey = (userId) => `profile:${userId}`;
+
+const devFaultsEnabled = () =>
+  process.env.DEV_FAULT_INJECTION === "true" && process.env.NODE_ENV !== "production";
 
 function withTimeout(promise, ms, label) {
   let timer;
@@ -84,6 +94,14 @@ export const authenticate = async (req, res, next) => {
     return res.status(401).json({ error: "Unauthorized", code: "AUTH_MISSING" });
   }
 
+  const forced = devFaultsEnabled()
+    ? String(req.headers["x-debug-fail"] || "").trim().toLowerCase()
+    : "";
+  if (forced === "auth") {
+    console.warn("[dev] X-Debug-Fail: auth - forcing 503 AUTH_UNAVAILABLE");
+    return sendUnavailable(res);
+  }
+
   let claims;
   try {
     claims = await verifySupabaseToken(token);
@@ -99,7 +117,12 @@ export const authenticate = async (req, res, next) => {
     return res.status(500).json({ error: "Authentication error", code: "AUTH_ERROR" });
   }
 
-  const { profile, ok } = await loadProfile(claims.sub);
+  let { profile, ok } = await loadProfile(claims.sub);
+  if (forced === "profile") {
+    console.warn("[dev] X-Debug-Fail: profile - treating profile as unavailable");
+    profile = null;
+    ok = false;
+  }
 
   req.user = {
     id: claims.sub,
