@@ -1,5 +1,5 @@
 import jwt
-from fastapi import Depends, Query
+from fastapi import Depends, Query, Request
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from starlette.concurrency import run_in_threadpool
 from uuid import UUID
@@ -12,8 +12,18 @@ logger = get_logger(__name__)
 
 bearer_scheme = HTTPBearer(auto_error=False)
 
+RETRY_AFTER = {"Retry-After": "5"}
+
+
+def _auth_unavailable() -> FitCheckException:
+    return FitCheckException(
+        "Authentication temporarily unavailable, please retry.",
+        code="AUTH_UNAVAILABLE", status_code=503, headers=RETRY_AFTER
+    )
+
 
 async def get_current_user_id(
+    request: Request,
     credentials: HTTPAuthorizationCredentials | None = Depends(bearer_scheme),
     user_id: UUID | None = Query(None)
 ) -> UUID:
@@ -23,16 +33,24 @@ async def get_current_user_id(
 
     Production: Authorization: Bearer <token> is required.
     The token is verified LOCALLY against Supabase's ES256 public keys
-    (core/auth/jwt_verifier.py) — no network call per request.
+    (core/auth/jwt_verifier.py) - no network call per request.
 
         bad / expired / forged token     -> 401 INVALID_TOKEN
-        signing keys can't be loaded     -> 503 AUTH_UNAVAILABLE (client retries,
-                                            must NOT log the user out)
+        signing keys can't be loaded     -> 503 AUTH_UNAVAILABLE + Retry-After: 5
+                                            (client retries, must NOT log out)
 
-    Development (DEV_AUTH_BYPASS=true): falls back to ?user_id=
-    if no Bearer token is provided — keeps curl/Postman
-    testing easy without weakening production behavior.
+    Development (DEV_AUTH_BYPASS=true) only:
+      * falls back to ?user_id= if no Bearer token is provided;
+      * header "X-Debug-Fail: auth" forces the 503 AUTH_UNAVAILABLE path on
+        ANY protected route, so the app can test its retry handling (AUTH-20).
+        Ignored completely when DEV_AUTH_BYPASS is off.
     """
+    if settings.DEV_AUTH_BYPASS:
+        forced = (request.headers.get("x-debug-fail") or "").strip().lower()
+        if forced == "auth":
+            logger.warning("[dev] X-Debug-Fail: auth - forcing 503 AUTH_UNAVAILABLE")
+            raise _auth_unavailable()
+
     if credentials and credentials.credentials:
         token = credentials.credentials.strip()
         if token:
@@ -40,10 +58,7 @@ async def get_current_user_id(
                 claims = await run_in_threadpool(verify_supabase_token, token)
             except AuthUnavailable as exc:
                 logger.warning(f"[auth] verification unavailable: {exc}")
-                raise FitCheckException(
-                    "Authentication temporarily unavailable, please retry.",
-                    code="AUTH_UNAVAILABLE", status_code=503
-                )
+                raise _auth_unavailable()
             except jwt.PyJWTError:
                 raise FitCheckException(
                     "Invalid or expired authentication token.",
@@ -65,7 +80,7 @@ async def get_current_user_id(
                 )
 
     if settings.DEV_AUTH_BYPASS and user_id is not None:
-        logger.warning(f"DEV_AUTH_BYPASS active — trusting user_id={user_id} from query param")
+        logger.warning(f"DEV_AUTH_BYPASS active - trusting user_id={user_id} from query param")
         return user_id
 
     raise FitCheckException(

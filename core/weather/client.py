@@ -13,15 +13,19 @@ CONDITION_MAP = {
     "mist": "fog",
     "fog": "fog",
     "haze": "fog",
+    "smoke": "fog",
+    "dust": "fog",
+    "sand": "fog",
     "clear": "clear",
+    "clouds": "cloudy",
 }
 
 
 class WeatherClient:
     """
     Thin wrapper around OpenWeatherMap.
-    No fashion logic here — just fetches and normalizes weather data.
-    Never raises — weather is optional context, not critical path.
+    No fashion logic here - just fetches and normalizes weather data.
+    Never raises - weather is optional context, not critical path.
     """
 
     def __init__(self):
@@ -38,7 +42,7 @@ class WeatherClient:
             return None
 
         if not self.api_key:
-            logger.warning("OpenWeatherMap API key not configured — skipping weather")
+            logger.warning("OpenWeatherMap API key not configured - skipping weather")
             return None
 
         try:
@@ -58,15 +62,20 @@ class WeatherClient:
             return self._normalize(data)
 
         except Exception as e:
-            logger.warning(f"Weather fetch failed — continuing without it: {e}")
+            logger.warning(f"Weather fetch failed - continuing without it: {e}")
             return None
 
     def _normalize(self, data: dict) -> dict:
         main = data.get("main", {})
-        weather_list = data.get("weather", [{}])
-        raw_condition = weather_list[0].get("main", "").lower() if weather_list else ""
+        weather_list = data.get("weather") or [{}]
+        first = weather_list[0] if weather_list else {}
+        raw_condition = (first.get("main") or "").lower()
         condition = CONDITION_MAP.get(raw_condition, "cloudy")
         wind = data.get("wind", {})
+
+        # OpenWeatherMap icon codes end in "d" (day) or "n" (night), e.g. "10n".
+        icon = first.get("icon") or ""
+        is_day = not icon.endswith("n")
 
         temp = main.get("temp")
 
@@ -74,6 +83,9 @@ class WeatherClient:
             "temp_celsius": temp,
             "feels_like": main.get("feels_like"),
             "condition": condition,
+            "icon_key": f"{condition}_{'day' if is_day else 'night'}",
+            "is_day": is_day,
+            "description": first.get("description"),
             "is_raining": condition == "rain",
             "is_snowing": condition == "snow",
             "is_windy": (wind.get("speed") or 0) > 8,

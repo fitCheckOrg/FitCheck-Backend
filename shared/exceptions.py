@@ -4,15 +4,18 @@ class FitCheckException(Exception):
         self,
         message: str,
         code: str = "FITCHECK_ERROR",
-        status_code: int = 500
+        status_code: int = 500,
+        headers: dict | None = None
     ):
         self.message = message
         self.code = code
         self.status_code = status_code
+        # Optional HTTP response headers, e.g. {"Retry-After": "5"} on a 503.
+        self.headers = headers
         super().__init__(message)
 
 
-# ── Image Validation ──────────────────────────────
+# -- Image Validation ------------------------------
 class ImageTooLargeError(FitCheckException):
     """Image exceeds maximum allowed size"""
     def __init__(self, message="Image too large. Maximum size is 10MB."):
@@ -29,7 +32,7 @@ class BlurryImageError(FitCheckException):
         super().__init__(message, code="BLURRY_IMAGE", status_code=400)
 
 
-# ── AI ────────────────────────────────────────────
+# -- AI ------------------------------
 class AIAnalysisError(FitCheckException):
     """GPT-4o analysis failed"""
     def __init__(self, message="AI analysis failed. Please try again."):
@@ -46,21 +49,21 @@ class OpenAIConnectionError(FitCheckException):
         super().__init__(message, code="OPENAI_CONNECTION_ERROR", status_code=503)
 
 
-# ── Storage ───────────────────────────────────────
+# -- Storage ------------------------------
 class StorageError(FitCheckException):
     """S3 upload or delete failed"""
     def __init__(self, message="Storage operation failed. Please try again."):
         super().__init__(message, code="STORAGE_ERROR", status_code=500)
 
 
-# ── Avatar ────────────────────────────────────────
+# -- Avatar ------------------------------
 class AvatarNotFoundError(FitCheckException):
     """Avatar doesn't exist for this user"""
     def __init__(self, message="Avatar not found. Please set up your avatar first."):
         super().__init__(message, code="AVATAR_NOT_FOUND", status_code=404)
 
 
-# ── Wardrobe ──────────────────────────────────────
+# -- Wardrobe ------------------------------
 class ClothingItemNotFoundError(FitCheckException):
     """Closet item doesn't exist"""
     def __init__(self, message="Clothing item not found."):
@@ -77,7 +80,7 @@ class DuplicateClothingItemError(FitCheckException):
         super().__init__(message, code="DUPLICATE_ITEM", status_code=409)
 
 
-# ── Subscription ──────────────────────────────────
+# -- Subscription ------------------------------
 class PremiumFeatureError(FitCheckException):
     """Feature requires premium subscription"""
     def __init__(self, message="This feature requires a FitCheck Premium subscription."):
@@ -89,7 +92,7 @@ class SubscriptionExpiredError(FitCheckException):
         super().__init__(message, code="SUBSCRIPTION_EXPIRED", status_code=403)
 
 
-# ── Auth ──────────────────────────────────────────
+# -- Auth ------------------------------
 class AuthenticationError(FitCheckException):
     """Authentication failed"""
     def __init__(self, message="Authentication failed. Please log in again."):
@@ -101,7 +104,7 @@ class AuthorizationError(FitCheckException):
         super().__init__(message, code="AUTHORIZATION_ERROR", status_code=403)
 
 
-# ── Rate Limiting ─────────────────────────────────
+# -- Rate Limiting ------------------------------
 class RateLimitExceededError(FitCheckException):
     """Too many requests"""
     def __init__(self, message="Too many requests. Please wait a moment and try again."):
@@ -109,6 +112,6 @@ class RateLimitExceededError(FitCheckException):
         
 class GarmentUnsupportedError(FitCheckException):
     """Garment representation built successfully, but shoulders_available
-    is False — expected V1 capability gap, not a server error."""
+    is False - expected V1 capability gap, not a server error."""
     def __init__(self, message="This garment is not supported by the current try-on fitting pipeline."):
         super().__init__(message, code="GARMENT_UNSUPPORTED", status_code=409)

@@ -129,3 +129,17 @@ def delete_look(user_id: UUID, look_id: UUID) -> dict:
     if not res.data:
         raise FitCheckException("Look not found.", code="LOOK_NOT_FOUND", status_code=404)
     return {"look_id": str(look_id), "deleted": True}
+
+
+def rename_look(user_id: UUID, look_id: UUID, name: str | None) -> dict:
+    """Set or clear (null / empty string) a look's name."""
+    clean_name = (name or "").strip() or None
+    if clean_name and len(clean_name) > MAX_NAME_LEN:
+        raise _bad_request(f"Name must be {MAX_NAME_LEN} characters or fewer.", "LOOK_NAME_TOO_LONG")
+
+    res = supabase.table(TABLE).update({"name": clean_name})\
+        .eq("look_id", str(look_id)).eq("user_id", str(user_id))\
+        .execute()
+    if not res.data:
+        raise FitCheckException("Look not found.", code="LOOK_NOT_FOUND", status_code=404)
+    return _to_look(res.data[0])

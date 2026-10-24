@@ -75,7 +75,7 @@ def generate_outfits(
         pool = _prioritize_by_mood(pool, mood)
 
     by_category = _group_by_category(pool)
-    by_category = _prune_categories(by_category, rng)
+    by_category = _prune_categories(by_category, rng, style_profile)
     candidates = _build_candidates(by_category)
 
     scored = []
@@ -222,7 +222,16 @@ def suggest_swaps(
     }
 
 
-def _prune_categories(by_category: dict[str, list[dict]], rng: random.Random) -> dict[str, list[dict]]:
+def _prune_categories(
+    by_category: dict[str, list[dict]],
+    rng: random.Random,
+    style_profile: dict | None = None,
+) -> dict[str, list[dict]]:
+    """
+    Keep at most MAX_ITEMS_PER_CATEGORY per category: favourites first, then
+    items the style profile prefers (so a liked colour isn't dropped before
+    scoring even starts), then least worn. No profile -> original ordering.
+    """
     pruned = {}
     for cat, items in by_category.items():
         shuffled = items[:]
@@ -231,6 +240,7 @@ def _prune_categories(by_category: dict[str, list[dict]], rng: random.Random) ->
             shuffled,
             key=lambda i: (
                 not i.get("favorite", False),
+                -_style_preference([i], style_profile)[0],
                 i.get("times_worn", 0)
             )
         )
@@ -291,13 +301,53 @@ def _norm_list(values) -> list[str]:
     return [str(v).strip().lower() for v in (values or []) if str(v).strip()]
 
 
+# Colour families. The quiz sends one word per family (black, white, grey,
+# navy, blue, beige, brown, green, olive, red, burgundy, pink, purple,
+# yellow, orange); the wardrobe AI writes free-form names ("gray",
+# "light gray", "maroon", "camouflage"...). Both sides are mapped to a
+# family before comparing. Unknown names only match themselves.
+COLOR_FAMILIES = {
+    "black": ["black", "jet", "onyx"],
+    "white": ["white", "snow"],
+    "grey": ["grey", "charcoal", "silver", "slate", "ash", "heather"],
+    "navy": ["navy", "navy blue", "dark blue", "midnight"],
+    "blue": ["blue", "denim", "sky", "cobalt", "azure", "teal"],
+    "beige": ["beige", "cream", "khaki", "sand", "camel", "ivory", "nude",
+              "off white", "taupe", "stone"],
+    "brown": ["brown", "tan", "chocolate", "coffee", "mocha", "cognac"],
+    "green": ["green", "emerald", "mint", "sage", "forest", "lime"],
+    "olive": ["olive", "camouflage", "camo", "army", "khaki green", "army green"],
+    "red": ["red", "crimson", "scarlet"],
+    "burgundy": ["burgundy", "maroon", "wine", "oxblood"],
+    "pink": ["pink", "rose", "blush", "fuchsia", "magenta"],
+    "purple": ["purple", "violet", "lavender", "lilac", "plum", "mauve"],
+    "yellow": ["yellow", "mustard", "gold", "lemon"],
+    "orange": ["orange", "rust", "coral", "peach", "terracotta"],
+}
+_COLOR_LOOKUP = {alias: family for family, aliases in COLOR_FAMILIES.items() for alias in aliases}
+
+
+def color_family(name) -> str | None:
+    """'light gray' -> 'grey', 'navy blue' -> 'navy', 'maroon' -> 'burgundy'."""
+    n = str(name or "").strip().lower().replace("-", " ").replace("gray", "grey")
+    n = " ".join(n.split())
+    if not n:
+        return None
+    if n in _COLOR_LOOKUP:
+        return _COLOR_LOOKUP[n]
+    for word in n.split():          # first recognised word wins: "olive green" -> olive
+        if word in _COLOR_LOOKUP:
+            return _COLOR_LOOKUP[word]
+    return n
+
+
 def _color_matches(item: dict, colors: list[str]) -> str | None:
-    """Return the profile colour this item matches, if any (case-insensitive)."""
-    item_color = str(item.get("dominant_color") or "").strip().lower()
-    if not item_color:
+    """Return the profile colour (family) this item matches, if any."""
+    item_family = color_family(item.get("dominant_color"))
+    if not item_family:
         return None
     for c in colors:
-        if c == item_color or c in item_color or item_color in c:
+        if color_family(c) == item_family:
             return c
     return None
 

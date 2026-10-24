@@ -12,11 +12,12 @@ from api.social import router as social_router
 from api.subscription import router as subscription_router
 from api.config import router as config_router
 from api.tryon import router as tryon_router
+from api.weather import router as weather_router
 
 
 app = FastAPI(title="FitCheck AI Service")
 
-# Global exception handler — no try/except in routes
+# Global exception handler - no try/except in routes
 @app.exception_handler(FitCheckException)
 async def fitcheck_exception_handler(request, exc):
     return JSONResponse(
@@ -27,7 +28,8 @@ async def fitcheck_exception_handler(request, exc):
                 "code": exc.code,
                 "message": exc.message
             }
-        }
+        },
+        headers=getattr(exc, "headers", None)
     )
 
 @app.exception_handler(Exception)
@@ -58,7 +60,8 @@ app.include_router(stylist_router, prefix="/api")
 app.include_router(social_router, prefix="/api")
 app.include_router(subscription_router, prefix="/api")
 app.include_router(config_router, prefix="/api")
-app.include_router(tryon_router, prefix="/api")  # Added tryon router
+app.include_router(tryon_router, prefix="/api")
+app.include_router(weather_router, prefix="/api")
 
 
 
