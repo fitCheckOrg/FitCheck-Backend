@@ -18,6 +18,15 @@ MOOD_STYLE_PRIORITY = {
 }
 
 MAX_ITEMS_PER_CATEGORY = 6
+
+# The Stylist accepts more occasions (OutfitOccasion) than the wardrobe AI
+# tags items with (everyday|work|party|sport|formal|outdoor). Without this
+# map, "date" and "travel" matched no item at all -> NO_VALID_COMBINATION.
+OCCASION_EQUIVALENTS = {
+    "date": {"date", "party", "formal", "everyday"},
+    "travel": {"travel", "everyday", "outdoor"},
+}
+
 MAX_SWAP_RESULTS = 5
 SWAP_MOOD_BONUS = 3  # rank-only nudge for swap candidates matching the mood
 
@@ -26,6 +35,13 @@ SWAP_MOOD_BONUS = 3  # rank-only nudge for swap candidates matching the mood
 STYLE_MATCH_BONUS = 2        # per item whose style is one the user picked
 PREFERRED_COLOR_BONUS = 1.5  # per item in a colour the user likes
 DISLIKED_COLOR_PENALTY = 6   # per item in a colour the user dislikes
+
+
+def _suits_occasion(item: dict, occasion: str) -> bool:
+    if occasion == "everyday":
+        return True
+    accepted = OCCASION_EQUIVALENTS.get(occasion, {occasion})
+    return bool(accepted & set(item.get("occasions") or []))
 
 
 def generate_outfits(
@@ -65,7 +81,7 @@ def generate_outfits(
     pool = [
         item for item in wardrobe_items
         if item["item_id"] not in excluded
-        and (occasion in (item.get("occasions") or []) or occasion == "everyday")
+        and _suits_occasion(item, occasion)
     ]
 
     if weather:
@@ -174,10 +190,7 @@ def suggest_swaps(
         and i["item_id"] not in excluded
     ]
     # Prefer items suited to the occasion; fall back to all of the category.
-    for_occasion = [
-        i for i in same_category
-        if occasion == "everyday" or occasion in (i.get("occasions") or [])
-    ]
+    for_occasion = [i for i in same_category if _suits_occasion(i, occasion)]
     pool = for_occasion or same_category
     mood_styles = set(MOOD_STYLE_PRIORITY.get((mood or "").lower(), []))
 

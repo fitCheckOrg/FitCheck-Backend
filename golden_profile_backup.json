@@ -1,20 +1,24 @@
 ﻿{
-    "profile_id":  "022fad78-d273-460b-9bed-c9b1c5afa54f",
+    "profile_id":  "0431f8cb-f319-4fb8-8dae-7d25e5ee5d1f",
     "user_id":  "15bacab3-5873-401b-9c9a-52f8b3eeeaf7",
     "styles":  [
-                   "minimalist"
+                   "athletic"
                ],
     "preferred_colors":  [
-                             "black"
+                             "black",
+                             "green"
                          ],
     "disliked_colors":  [
-
+                            "blue",
+                            "purple",
+                            "brown"
                         ],
     "favorite_occasions":  [
-
+                               "formal",
+                               "work"
                            ],
     "onboarding_completed":  true,
-    "created_at":  "2026-07-18T20:08:12.005874+00:00",
-    "updated_at":  "2026-10-15T10:17:33.676011+00:00",
+    "created_at":  "2026-10-19T00:27:00.723958+00:00",
+    "updated_at":  "2026-10-23T13:50:47.167191+00:00",
     "self_reported_body_shape":  "inverted_triangle"
 }
