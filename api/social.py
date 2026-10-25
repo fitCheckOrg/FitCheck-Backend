@@ -23,7 +23,7 @@ class ReactRequest(BaseModel):
 
 @router.get("/health")
 async def health():
-    return { "service": "social", "version": "1.0.0", "status": "healthy" }
+    return { "service": "social", "version": "1.1.0", "status": "healthy" }
 
 
 @router.post("/follow/{target_user_id}", response_model=SuccessResponse)
@@ -38,7 +38,7 @@ async def follow_user(
             code="INVALID_FOLLOW", status_code=400
         )
 
-    logger.info(f"Follow — follower={user_id} following={target_user_id}")
+    logger.info(f"Follow - follower={user_id} following={target_user_id}")
 
     user_result = supabase.table("profiles")\
         .select("id")\
@@ -90,7 +90,7 @@ async def unfollow_user(
     user_id: UUID = Depends(get_current_user_id)
 ):
     """Unfollow a user"""
-    logger.info(f"Unfollow — follower={user_id} following={target_user_id}")
+    logger.info(f"Unfollow - follower={user_id} following={target_user_id}")
 
     supabase.table("follows")\
         .delete()\
@@ -160,7 +160,7 @@ async def get_following(
 
 
 def _get_follow_counts(user_id: str) -> dict:
-    """Shared helper — returns current followers/following counts for a user."""
+    """Shared helper - returns current followers/following counts for a user."""
     followers = supabase.table("follows")\
         .select("follower_id", count="exact")\
         .eq("following_id", user_id).execute()
@@ -199,7 +199,7 @@ async def react_to_outfit(
             "Outfit not found.", code="OUTFIT_NOT_FOUND", status_code=404
         )
 
-    logger.info(f"React — outfit={outfit_id} user={user_id} reaction={body.reaction}")
+    logger.info(f"React - outfit={outfit_id} user={user_id} reaction={body.reaction}")
 
     result = supabase.table("outfit_reactions")\
         .upsert({
@@ -229,7 +229,7 @@ async def remove_reaction(
     user_id: UUID = Depends(get_current_user_id)
 ):
     """Remove your reaction from an outfit"""
-    logger.info(f"Remove reaction — outfit={outfit_id} user={user_id}")
+    logger.info(f"Remove reaction - outfit={outfit_id} user={user_id}")
 
     supabase.table("outfit_reactions")\
         .delete()\
@@ -275,7 +275,7 @@ async def get_reactions(
 
 
 def _get_reaction_counts(outfit_id: str) -> dict:
-    """Shared helper — returns reaction counts by type for an outfit."""
+    """Shared helper - returns reaction counts by type for an outfit."""
     counts = {r: 0 for r in VALID_REACTIONS}
 
     result = supabase.table("outfit_reactions")\
@@ -301,11 +301,11 @@ async def get_discover_feed(
 ):
     """
     Browse public outfits from the community.
-    sort=recent    → newest public outfits first
-    sort=popular    → most total reactions first
-    sort=following  → public outfits only from users you follow, newest first
+    sort=recent    -> newest public outfits first
+    sort=popular    -> most total reactions first
+    sort=following  -> public outfits only from users you follow, newest first
     """
-    logger.info(f"Get feed — user={user_id} sort={sort} category={category}")
+    logger.info(f"Get feed - user={user_id} sort={sort} category={category}")
 
     feed_fields = (
         "outfit_id, user_id, overall_score, overall_grade, "
@@ -419,10 +419,14 @@ def _get_bulk_reaction_counts(outfit_ids: list[str]) -> dict[str, dict]:
     return counts_by_outfit
 def _get_bulk_creator_profiles(user_ids: list[str]) -> dict[str, dict]:
     """
-    Fetch creator display info in one bulk query. Only pulls fields
-    confirmed to exist on `profiles` (id, full_name) — avatar comes
-    from a separate bulk query against `avatars`, not assumed to
-    live on profiles.
+    Fetch creator display info in one bulk query (profiles: id, full_name).
+
+    avatar_url is ALWAYS None on purpose (AV-7 privacy decision, 2026-10-25):
+    the try-on avatar is the user's full-body photo, uploaded for a private
+    try-on experience. Publishing an outfit is not consent to show that
+    photo to other users. A public profile picture will be a separate
+    feature with its own explicit upload and visibility rules. Flutter
+    shows the creator's initials when avatar_url is null.
     """
     if not user_ids:
         return {}
@@ -432,23 +436,13 @@ def _get_bulk_creator_profiles(user_ids: list[str]) -> dict[str, dict]:
         .in_("id", user_ids)\
         .execute()
 
-    avatars_result = supabase.table("avatars")\
-        .select("user_id, processed_photo_url")\
-        .in_("user_id", user_ids)\
-        .execute()
-
-    avatar_by_user = {
-        row["user_id"]: row.get("processed_photo_url")
-        for row in (avatars_result.data or [])
-    }
-
     creators = {}
     for row in (profiles_result.data or []):
         uid = row["id"]
         creators[uid] = {
             "user_id": uid,
             "display_name": row.get("full_name"),
-            "avatar_url": avatar_by_user.get(uid)
+            "avatar_url": None
         }
 
     return creators
@@ -515,7 +509,7 @@ async def save_outfit_bookmark(
     user_id: UUID = Depends(get_current_user_id)
 ):
     """Bookmark an outfit for later"""
-    logger.info(f"Save outfit — outfit={outfit_id} user={user_id}")
+    logger.info(f"Save outfit - outfit={outfit_id} user={user_id}")
 
     outfit_result = supabase.table("outfits")\
         .select("outfit_id")\
@@ -558,7 +552,7 @@ async def remove_saved_outfit(
     user_id: UUID = Depends(get_current_user_id)
 ):
     """Remove a bookmarked outfit"""
-    logger.info(f"Unsave outfit — outfit={outfit_id} user={user_id}")
+    logger.info(f"Unsave outfit - outfit={outfit_id} user={user_id}")
 
     supabase.table("saved_outfits")\
         .delete()\
