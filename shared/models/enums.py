@@ -81,7 +81,7 @@ class WaistDefinition(str, Enum):
     DEFINED = "defined"
     AVERAGE = "average"
     UNDEFINED = "undefined"
-    
+
 class BodyOrientation(str, Enum):
     FRONT = "front"
     FRONT_LEFT = "front_left"
@@ -113,13 +113,21 @@ class OutfitMood(str, Enum):
     DATE = "date"
     SPORTY = "sporty"
     CREATIVE = "creative"
+
+
 class DiscoverCategory(str, Enum):
-    EDITORIAL = "editorial"
-    STREETWEAR = "streetwear"
-    MINIMAL = "minimal"
+    """
+    Discover feed categories (A2, 2026-10-31) - 1:1 with the Discover design tabs:
+    Everyday · Work · Night Out · Date · Formal · Street · Travel · Sport · Weekend.
+    Replaced the old style-based list (editorial, streetwear, minimal, ...);
+    the one existing 'streetwear' post was moved to 'street'.
+    """
+    EVERYDAY = "everyday"
+    WORK = "work"
+    NIGHT_OUT = "night_out"
+    DATE = "date"
     FORMAL = "formal"
-    VINTAGE = "vintage"
-    AFROCENTRIC = "afrocentric"
-    DATE_NIGHT = "date_night"
-    Y2K_REVIVAL = "y2k_revival"
-    FESTIVAL = "festival"
+    STREET = "street"
+    TRAVEL = "travel"
+    SPORT = "sport"
+    WEEKEND = "weekend"

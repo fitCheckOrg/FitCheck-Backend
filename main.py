@@ -13,6 +13,7 @@ from api.subscription import router as subscription_router
 from api.config import router as config_router
 from api.tryon import router as tryon_router
 from api.weather import router as weather_router
+from api.collections import router as collections_router
 
 
 app = FastAPI(title="FitCheck AI Service")
@@ -62,6 +63,7 @@ app.include_router(subscription_router, prefix="/api")
 app.include_router(config_router, prefix="/api")
 app.include_router(tryon_router, prefix="/api")
 app.include_router(weather_router, prefix="/api")
+app.include_router(collections_router, prefix="/api")
 
 
 

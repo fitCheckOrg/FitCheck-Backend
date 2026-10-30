@@ -23,7 +23,7 @@ class ReactRequest(BaseModel):
 
 @router.get("/health")
 async def health():
-    return { "service": "social", "version": "1.1.0", "status": "healthy" }
+    return { "service": "social", "version": "1.4.0", "status": "healthy" }
 
 
 @router.post("/follow/{target_user_id}", response_model=SuccessResponse)
@@ -43,7 +43,7 @@ async def follow_user(
     user_result = supabase.table("profiles")\
         .select("id")\
         .eq("id", str(target_user_id))\
-        .single()\
+        .limit(1)\
         .execute()
 
     if not user_result.data:
@@ -60,7 +60,9 @@ async def follow_user(
     if existing.data:
         return SuccessResponse(data={
             "message": "Already following",
-            "following_id": str(target_user_id)
+            "following_id": str(target_user_id),
+            "is_following": True,
+            **_get_follow_counts(str(target_user_id))
         })
 
     result = supabase.table("follows")\
@@ -80,6 +82,7 @@ async def follow_user(
     return SuccessResponse(data={
         "message": "Now following",
         "following_id": str(target_user_id),
+        "is_following": True,
         **counts
     })
 
@@ -103,6 +106,7 @@ async def unfollow_user(
     return SuccessResponse(data={
         "message": "Unfollowed",
         "following_id": str(target_user_id),
+        "is_following": False,
         **counts
     })
 
@@ -188,16 +192,7 @@ async def react_to_outfit(
             code="INVALID_REACTION", status_code=400
         )
 
-    outfit_result = supabase.table("outfits")\
-        .select("outfit_id")\
-        .eq("outfit_id", str(outfit_id))\
-        .single()\
-        .execute()
-
-    if not outfit_result.data:
-        raise FitCheckException(
-            "Outfit not found.", code="OUTFIT_NOT_FOUND", status_code=404
-        )
+    _require_visible_outfit(str(outfit_id), str(user_id))
 
     logger.info(f"React - outfit={outfit_id} user={user_id} reaction={body.reaction}")
 
@@ -274,6 +269,20 @@ async def get_reactions(
     })
 
 
+def _require_visible_outfit(outfit_id: str, user_id: str) -> None:
+    """404 unless the outfit exists AND is public or belongs to the caller."""
+    res = supabase.table("outfits")\
+        .select("outfit_id, user_id, is_public")\
+        .eq("outfit_id", outfit_id)\
+        .limit(1)\
+        .execute()
+    row = res.data[0] if res.data else None
+    if not row or not (row.get("is_public") or str(row.get("user_id")) == user_id):
+        raise FitCheckException(
+            "Outfit not found.", code="OUTFIT_NOT_FOUND", status_code=404
+        )
+
+
 def _get_reaction_counts(outfit_id: str) -> dict:
     """Shared helper - returns reaction counts by type for an outfit."""
     counts = {r: 0 for r in VALID_REACTIONS}
@@ -309,7 +318,8 @@ async def get_discover_feed(
 
     feed_fields = (
         "outfit_id, user_id, overall_score, overall_grade, "
-        "item_ids, occasion, name, created_at, is_public, category"
+        "item_ids, occasion, name, created_at, is_public, category, "
+        "ai_summary, show_score"
     )
 
     if sort == "following":
@@ -345,7 +355,6 @@ async def get_discover_feed(
         query = query.eq("category", category.value)
 
     result = query.execute()
-    result = query.execute()
     outfits = result.data or []
     total = result.count or 0
 
@@ -355,7 +364,7 @@ async def get_discover_feed(
 
     reaction_counts_by_outfit = _get_bulk_reaction_counts(outfit_ids)
     creator_profiles = _get_bulk_creator_profiles(creator_ids)
-    cover_images_by_outfit_items = _get_bulk_item_images(all_item_ids)
+    item_details = _get_bulk_item_details(all_item_ids)
     my_reactions = _get_bulk_my_reactions(outfit_ids, str(user_id))
     my_saved = _get_bulk_saved_status(outfit_ids, str(user_id))
     my_following = _get_bulk_following_status(creator_ids, str(user_id))
@@ -368,15 +377,24 @@ async def get_discover_feed(
         outfit["reaction_counts"] = counts
         outfit["total_reactions"] = sum(counts.values())
 
-        outfit["creator"] = creator_profiles.get(creator_id, {
+        creator = dict(creator_profiles.get(creator_id, {
             "user_id": creator_id, "display_name": None, "avatar_url": None
-        })
+        }))
+        creator["is_following"] = creator_id in my_following
+        outfit["creator"] = creator
 
         item_ids = outfit.get("item_ids") or []
+        # Pieces in outfit order (A1). A piece the owner deleted from their
+        # closet comes back as {item_id, deleted: true}.
+        outfit["items"] = [
+            item_details.get(iid, {"item_id": iid, "deleted": True})
+            for iid in item_ids
+        ]
+        # Kept for older app builds: first two cut-out images.
         outfit["cover_images"] = [
-            cover_images_by_outfit_items[iid]
+            item_details[iid]["image_url"]
             for iid in item_ids[:2]
-            if iid in cover_images_by_outfit_items
+            if iid in item_details and item_details[iid].get("image_url")
         ]
         outfit["image_count"] = len(item_ids)
 
@@ -388,6 +406,8 @@ async def get_discover_feed(
         outfit["comment_count"] = 0
         outfit["share_count"] = 0
 
+        _apply_score_visibility(outfit)
+
     if sort == "popular":
         outfits.sort(key=lambda o: o["total_reactions"], reverse=True)
 
@@ -398,6 +418,22 @@ async def get_discover_feed(
             "has_more": (offset + limit) < total
         }
     })
+def _apply_score_visibility(outfit: dict) -> None:
+    """
+    A3: the creator chooses whether the score + AI note are shown on the post.
+    show_score defaults to True. When False, the three fields are sent as null.
+    ai_personalization_note is never selected for social responses (it can
+    describe the owner's body / profile).
+    """
+    show = outfit.get("show_score")
+    show = True if show is None else bool(show)
+    outfit["show_score"] = show
+    if not show:
+        outfit["overall_score"] = None
+        outfit["overall_grade"] = None
+        outfit["ai_summary"] = None
+
+
 def _get_bulk_reaction_counts(outfit_ids: list[str]) -> dict[str, dict]:
     """Fetch reaction counts for multiple outfits in one query, grouped by outfit_id."""
     if not outfit_ids:
@@ -447,18 +483,28 @@ def _get_bulk_creator_profiles(user_ids: list[str]) -> dict[str, dict]:
 
     return creators
 
-def _get_bulk_item_images(item_ids: list[str]) -> dict[str, str]:
-    """Fetch clean_image_url for multiple wardrobe items in one query."""
+def _get_bulk_item_details(item_ids: list[str]) -> dict[str, dict]:
+    """
+    Fetch the public piece info for many wardrobe items in one query.
+    Only the clean cut-out image and descriptive tags - nothing personal.
+    """
     if not item_ids:
         return {}
 
     result = supabase.table("closet_items")\
-        .select("item_id, clean_image_url")\
+        .select("item_id, clean_image_url, category, item_type, dominant_color")\
         .in_("item_id", item_ids)\
         .execute()
 
     return {
-        row["item_id"]: row["clean_image_url"]
+        row["item_id"]: {
+            "item_id": row["item_id"],
+            "image_url": row.get("clean_image_url"),
+            "category": row.get("category"),
+            "item_type": row.get("item_type"),
+            "dominant_color": row.get("dominant_color"),
+            "deleted": False,
+        }
         for row in (result.data or [])
     }
 
@@ -511,16 +557,7 @@ async def save_outfit_bookmark(
     """Bookmark an outfit for later"""
     logger.info(f"Save outfit - outfit={outfit_id} user={user_id}")
 
-    outfit_result = supabase.table("outfits")\
-        .select("outfit_id")\
-        .eq("outfit_id", str(outfit_id))\
-        .single()\
-        .execute()
-
-    if not outfit_result.data:
-        raise FitCheckException(
-            "Outfit not found.", code="OUTFIT_NOT_FOUND", status_code=404
-        )
+    _require_visible_outfit(str(outfit_id), str(user_id))
 
     existing = supabase.table("saved_outfits")\
         .select("outfit_id")\
