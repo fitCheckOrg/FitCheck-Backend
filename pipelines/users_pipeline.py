@@ -1,6 +1,8 @@
 """
 Users (Discover part 2): B9 handles (2026-10-31), B10 public profiles (2026-11-02),
-B10.4 public profile photo (2026-11-03), B11 follow lists (2026-11-03).
+B10.4 public profile photo (2026-11-03), B11 follow lists (2026-11-03),
+E18 safety filters (2026-11-03): blocked either way -> 404 / never listed,
+hidden -> never listed, posts under review only visible to their owner.
 
 One place that builds the public `user` object every social response uses:
     {user_id, display_name, handle, avatar_url, avatar_url_small, is_following, is_me}
@@ -35,6 +37,7 @@ from postgrest.exceptions import APIError
 from core.storage.s3 import storage
 from core.storage.supabase_client import supabase
 from shared.exceptions import FitCheckException
+from pipelines.safety_pipeline import is_blocked_either_way, excluded_user_ids, not_in
 
 logger = logging.getLogger(__name__)
 
@@ -231,9 +234,9 @@ def set_handle(user_id: UUID, raw) -> dict:
 def get_by_handle(raw, viewer_id: UUID) -> dict:
     handle = normalize_handle(raw)
     owner = _owner_of(handle) if handle else None
-    if not owner:
-        raise _user_not_found()
     viewer = str(viewer_id)
+    if not owner or is_blocked_either_way(owner, viewer):
+        raise _user_not_found()
     return build_users([owner], viewer).get(owner) or unknown_user(owner, viewer)
 
 
@@ -268,11 +271,11 @@ def _follows_me(owner: str, viewer: str) -> bool:
 
 
 def public_profile(target_id, viewer_id) -> dict:
-    """B10.1 - 404 USER_NOT_FOUND if the user doesn't exist.
-    (E18 will also return 404 when either side has blocked the other.)"""
+    """B10.1 - 404 USER_NOT_FOUND if the user doesn't exist,
+    or (E18) when either side has blocked the other."""
     uid, viewer = str(target_id), str(viewer_id)
     row = _profile_row(uid)
-    if not row:
+    if not row or is_blocked_either_way(uid, viewer):
         raise _user_not_found()
     user = build_users([uid], viewer).get(uid) or unknown_user(uid, viewer)
     return {
@@ -364,7 +367,7 @@ def user_posts(target_id, viewer_id, cursor: str | None = None,
     from api.social import FEED_FIELDS, _decorate_posts
 
     uid, viewer = str(target_id), str(viewer_id)
-    if not _profile_row(uid):
+    if not _profile_row(uid) or is_blocked_either_way(uid, viewer):
         raise _user_not_found()
     limit = max(1, min(int(limit), MAX_PAGE))
     private = include_private and uid == viewer
@@ -373,6 +376,8 @@ def user_posts(target_id, viewer_id, cursor: str | None = None,
     q = supabase.table("outfits").select(FEED_FIELDS).eq("user_id", uid)
     if not private:
         q = q.eq("is_public", True)
+    if uid != viewer:
+        q = q.eq("under_review", False)              # E18: only the owner sees these
     if cursor:
         ts, oid = _decode_cursor(cursor)
         q = q.or_(f'{col}.lt."{ts}",and({col}.eq."{ts}",outfit_id.lt.{oid})')
@@ -415,7 +420,7 @@ def follow_list(target_id, viewer_id, direction: str, cursor: str | None = None,
     (follows.created_at, person id). is_following is from the VIEWER's side.
     """
     uid, viewer = str(target_id), str(viewer_id)
-    if not _profile_row(uid):
+    if not _profile_row(uid) or is_blocked_either_way(uid, viewer):
         raise _user_not_found()
     limit = max(1, min(int(limit), MAX_PAGE))
     if direction == "followers":
@@ -424,6 +429,7 @@ def follow_list(target_id, viewer_id, direction: str, cursor: str | None = None,
         match_col, person_col = "follower_id", "following_id"
 
     query = supabase.table("follows").select(f"{person_col}, created_at").eq(match_col, uid)
+    query = not_in(query, person_col, excluded_user_ids(viewer))     # E18
 
     term = _search_term(q) if q else ""
     if term:

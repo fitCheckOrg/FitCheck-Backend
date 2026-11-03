@@ -13,6 +13,10 @@ from shared.models.enums import DiscoverCategory
 from pipelines.users_pipeline import (
     build_users, unknown_user, _following_set, _encode_cursor, _decode_cursor,
 )
+from pipelines.safety_pipeline import (
+    excluded_user_ids, is_blocked_either_way, not_interested_post_ids, not_in,
+    mark_not_interested, unmark_not_interested, report_post,
+)
 
 
 
@@ -42,6 +46,11 @@ class PublishPostRequest(BaseModel):
     show_score: bool = True
 
 
+class ReportRequest(BaseModel):
+    reason: str
+    note: str | None = None
+
+
 class EditPostRequest(BaseModel):
     caption: str | None = None
     category: DiscoverCategory | None = None
@@ -49,7 +58,7 @@ class EditPostRequest(BaseModel):
 
 @router.get("/health")
 async def health():
-    return { "service": "social", "version": "1.11.0", "status": "healthy" }
+    return { "service": "social", "version": "1.12.0", "status": "healthy" }
 
 
 @router.post("/follow/{target_user_id}", response_model=SuccessResponse)
@@ -72,7 +81,8 @@ async def follow_user(
         .limit(1)\
         .execute()
 
-    if not user_result.data:
+    # E18: you can't follow someone you blocked / who blocked you.
+    if not user_result.data or is_blocked_either_way(target_user_id, user_id):
         raise FitCheckException(
             "User not found.", code="USER_NOT_FOUND", status_code=404
         )
@@ -298,14 +308,18 @@ async def get_reactions(
 
 
 def _require_visible_outfit(outfit_id: str, user_id: str) -> None:
-    """404 unless the outfit exists AND is public or belongs to the caller."""
+    """404 unless the outfit exists AND is public or belongs to the caller.
+    E18: also 404 when it's under review or its creator is blocked either way
+    (unless it's the caller's own)."""
     res = supabase.table("outfits")\
-        .select("outfit_id, user_id, is_public")\
+        .select("outfit_id, user_id, is_public, under_review")\
         .eq("outfit_id", outfit_id)\
         .limit(1)\
         .execute()
     row = res.data[0] if res.data else None
-    if not row or not (row.get("is_public") or str(row.get("user_id")) == user_id):
+    mine = bool(row) and str(row.get("user_id")) == user_id
+    if not row or not (row.get("is_public") or mine) or (not mine and (
+            row.get("under_review") or is_blocked_either_way(row["user_id"], user_id))):
         raise FitCheckException(
             "Outfit not found.", code="OUTFIT_NOT_FOUND", status_code=404
         )
@@ -331,7 +345,7 @@ def _get_reaction_counts(outfit_id: str) -> dict:
 FEED_FIELDS = (
     "outfit_id, user_id, overall_score, overall_grade, "
     "item_ids, occasion, name, created_at, published_at, is_public, category, "
-    "caption, ai_highlights, show_score"
+    "caption, ai_highlights, show_score, under_review"
 )
 
 
@@ -353,16 +367,21 @@ async def get_discover_feed(
     logger.info(f"Get feed - user={user_id} sort={sort} category={category}")
 
     feed_fields = FEED_FIELDS
+    # E18: never show blocked / hidden people, posts I'm not interested in,
+    # or posts under review.
+    excluded = excluded_user_ids(user_id)
+    skipped_posts = not_interested_post_ids(user_id)
 
     if sort in ("popular", "trending"):
-        return _ranked_feed(sort, category, limit, offset, str(user_id))
+        return _ranked_feed(sort, category, limit, offset, str(user_id), excluded, skipped_posts)
 
     if sort == "following":
         follows_result = supabase.table("follows")\
             .select("following_id")\
             .eq("follower_id", str(user_id))\
             .execute()
-        following_ids = [f["following_id"] for f in (follows_result.data or [])]
+        following_ids = [f["following_id"] for f in (follows_result.data or [])
+                         if str(f["following_id"]) not in excluded]
 
         if not following_ids:
             return SuccessResponse(data={
@@ -386,6 +405,9 @@ async def get_discover_feed(
 
     if category:
         query = query.eq("category", category.value)
+    query = not_in(query, "user_id", excluded)
+    query = not_in(query, "outfit_id", skipped_posts)
+    query = query.eq("under_review", False)
 
     result = query.execute()
     outfits = result.data or []
@@ -400,7 +422,9 @@ async def get_discover_feed(
             "has_more": (offset + limit) < total
         }
     })
-def _ranked_feed(sort: str, category, limit: int, offset: int, user_id: str) -> SuccessResponse:
+def _ranked_feed(sort: str, category, limit: int, offset: int, user_id: str,
+                 excluded: set[str] = frozenset(), skipped_posts: set[str] = frozenset()
+                 ) -> SuccessResponse:
     """
     A8: popular / trending, ranked in the database across ALL public posts
     (view public_post_rank), then the page's posts are loaded and decorated.
@@ -412,6 +436,8 @@ def _ranked_feed(sort: str, category, limit: int, offset: int, user_id: str) -> 
         .select("outfit_id", count="exact")
     if category:
         rq = rq.eq("category", category.value)
+    rq = not_in(rq, "user_id", excluded)
+    rq = not_in(rq, "outfit_id", skipped_posts)
     ranked = rq.order(metric, desc=True)\
         .order("published_at", desc=True, nullsfirst=False)\
         .range(offset, offset + limit - 1)\
@@ -423,7 +449,8 @@ def _ranked_feed(sort: str, category, limit: int, offset: int, user_id: str) -> 
     outfits = []
     if ids:
         rows = supabase.table("outfits").select(FEED_FIELDS)\
-            .in_("outfit_id", ids).eq("is_public", True).execute().data or []
+            .in_("outfit_id", ids).eq("is_public", True)\
+            .eq("under_review", False).execute().data or []
         by_id = {r["outfit_id"]: r for r in rows}
         outfits = [by_id[i] for i in ids if i in by_id]   # keep the ranked order
 
@@ -453,7 +480,8 @@ def _decorate_posts(outfits: list[dict], user_id: str) -> None:
     all_item_ids = list({item_id for o in outfits for item_id in (o.get("item_ids") or [])})
 
     reaction_counts_by_outfit, reactors_by_outfit = _get_bulk_reactions(outfit_ids)
-    previews = _pick_reacted_by_previews(reactors_by_outfit, user_id)
+    previews = _pick_reacted_by_previews(reactors_by_outfit, user_id,
+                                         excluded_user_ids(user_id) if outfits else set())
     preview_ids = {u for ids in previews.values() for u in ids}
     creators = build_users(list(set(creator_ids) | preview_ids), user_id)
     item_details = _get_bulk_item_details(all_item_ids)
@@ -524,12 +552,16 @@ async def get_post(
         .limit(1)\
         .execute()
 
-    if not result.data:
+    row = result.data[0] if result.data else None
+    if row and str(row["user_id"]) != str(user_id) and (
+            row.get("under_review") or is_blocked_either_way(row["user_id"], user_id)):
+        row = None                                   # E18
+    if not row:
         raise FitCheckException(
             "This post isn't available.", code="POST_NOT_FOUND", status_code=404
         )
 
-    posts = result.data
+    posts = [row]
     _decorate_posts(posts, str(user_id))
     return SuccessResponse(data=posts[0])
 
@@ -550,9 +582,11 @@ async def get_post_reactors(
     and it matches `type`). Keyset cursor on (reacted_at, user_id).
     """
     pid, me = str(post_id), str(user_id)
-    post = supabase.table("outfits").select("outfit_id, user_id, is_public")\
+    post = supabase.table("outfits").select("outfit_id, user_id, is_public, under_review")\
         .eq("outfit_id", pid).limit(1).execute().data
-    if not post or not (post[0].get("is_public") or str(post[0].get("user_id")) == me):
+    mine = bool(post) and str(post[0].get("user_id")) == me
+    if not post or not (post[0].get("is_public") or mine) or (not mine and (
+            post[0].get("under_review") or is_blocked_either_way(post[0]["user_id"], me))):
         raise FitCheckException(
             "This post isn't available.", code="POST_NOT_FOUND", status_code=404
         )
@@ -568,6 +602,7 @@ async def get_post_reactors(
     query = supabase.table("outfit_reactions")\
         .select("user_id, reaction, created_at")\
         .eq("outfit_id", pid).neq("user_id", me)
+    query = not_in(query, "user_id", excluded_user_ids(me))        # E18
     if type:
         query = query.eq("reaction", type)
     if cursor:
@@ -597,6 +632,24 @@ async def get_post_reactors(
         last = rows[-1]
         next_cursor = _encode_cursor(str(last["created_at"]), str(last["user_id"]))
     return SuccessResponse(data={"totals": totals, "items": items, "next_cursor": next_cursor})
+
+
+# ---------------------------------------------------------------- E18 safety (posts)
+
+@router.post("/posts/{post_id}/not-interested", response_model=SuccessResponse)
+async def post_not_interested(post_id: UUID, user_id: UUID = Depends(get_current_user_id)):
+    return SuccessResponse(data=mark_not_interested(user_id, post_id))
+
+
+@router.delete("/posts/{post_id}/not-interested", response_model=SuccessResponse)
+async def delete_not_interested(post_id: UUID, user_id: UUID = Depends(get_current_user_id)):
+    return SuccessResponse(data=unmark_not_interested(user_id, post_id))
+
+
+@router.post("/posts/{post_id}/report", response_model=SuccessResponse)
+async def post_report(post_id: UUID, body: ReportRequest,
+                      user_id: UUID = Depends(get_current_user_id)):
+    return SuccessResponse(data=report_post(user_id, post_id, body.reason, body.note))
 
 
 def _clean_caption(caption) -> str | None:
@@ -786,13 +839,16 @@ def _get_bulk_reactions(outfit_ids: list[str]) -> tuple[dict[str, dict], dict[st
 
 
 def _pick_reacted_by_previews(reactors_by_outfit: dict[str, list[str]],
-                              viewer_id: str) -> dict[str, list[str]]:
-    """Per outfit: up to PREVIEW_SIZE reactor ids, people the viewer follows first."""
-    everyone = list({u for ids in reactors_by_outfit.values() for u in ids if u != viewer_id})
+                              viewer_id: str, excluded: set[str] = frozenset()
+                              ) -> dict[str, list[str]]:
+    """Per outfit: up to PREVIEW_SIZE reactor ids, people the viewer follows first.
+    Never the viewer, never blocked / hidden people (E18)."""
+    skip = set(excluded) | {viewer_id}
+    everyone = list({u for ids in reactors_by_outfit.values() for u in ids if u not in skip})
     followed = _following_set(viewer_id, everyone)
     out = {}
     for oid, ids in reactors_by_outfit.items():
-        others = [u for u in ids if u != viewer_id]
+        others = [u for u in ids if u not in skip]
         ordered = [u for u in others if u in followed] + [u for u in others if u not in followed]
         out[oid] = ordered[:PREVIEW_SIZE]
     return out

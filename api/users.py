@@ -27,10 +27,18 @@ GET    /api/users/{user_id}/following?cursor=&limit=&q=   -> {items: [user], nex
 GET    /api/users/me/followers | /api/users/me/following  (same, for yourself)
 DELETE /api/users/me/followers/{user_id}                   -> {removed: true, user_id}
 
+E18 safety (2026-11-03):
+POST/DELETE /api/users/{user_id}/block    -> {blocked, user_id}
+POST/DELETE /api/users/{user_id}/hide     -> {hidden, user_id}
+GET         /api/users/me/blocked?cursor= -> {items: [user], next_cursor}
+POST        /api/users/{user_id}/report  {reason, note?} -> {reported: true}
+
 Errors: 400 HANDLE_INVALID | 400 HANDLE_RESERVED | 409 HANDLE_TAKEN |
         429 HANDLE_CHANGE_TOO_SOON | 404 USER_NOT_FOUND |
         400 BIO_TOO_LONG | 400 CITY_INVALID | 400 STYLE_TAG_INVALID | 400 INVALID_CURSOR |
-        400 PHOTO_INVALID | 413 PHOTO_TOO_LARGE
+        400 PHOTO_INVALID | 413 PHOTO_TOO_LARGE |
+        400 CANNOT_BLOCK_SELF | 400 CANNOT_HIDE_SELF | 400 CANNOT_REPORT_SELF |
+        400 INVALID_REPORT_REASON | 400 NOTE_REQUIRED | 400 NOTE_TOO_LONG
 """
 
 from uuid import UUID
@@ -46,12 +54,20 @@ from pipelines.users_pipeline import (
     follow_list, remove_follower,
 )
 from pipelines.profile_photo_pipeline import upload_profile_photo, delete_profile_photo, MAX_BYTES
+from pipelines.safety_pipeline import (
+    block_user, unblock_user, list_blocked, hide_user, unhide_user, report_user,
+)
 
 router = APIRouter(prefix="/users", tags=["Users"])
 
 
 class UpdateMeRequest(BaseModel):
     handle: str
+
+
+class ReportRequest(BaseModel):
+    reason: str
+    note: str | None = None
 
 
 class UpdatePublicProfileRequest(BaseModel):
@@ -62,7 +78,7 @@ class UpdatePublicProfileRequest(BaseModel):
 
 @router.get("/health")
 def health():
-    return {"service": "users", "version": "1.3.0", "status": "healthy"}
+    return {"service": "users", "version": "1.4.0", "status": "healthy"}
 
 
 @router.get("/handle-available")
@@ -137,6 +153,15 @@ def delete_my_follower(follower_id: UUID, user_id: UUID = Depends(get_current_us
     return SuccessResponse(data=remove_follower(user_id, follower_id))
 
 
+@router.get("/me/blocked")
+def read_my_blocked(
+    cursor: str | None = Query(None),
+    limit: int = Query(20, ge=1, le=50),
+    user_id: UUID = Depends(get_current_user_id),
+):
+    return SuccessResponse(data=list_blocked(user_id, cursor, limit))
+
+
 # ---------------------------------------------------------------- B10
 
 @router.get("/me/public")
@@ -196,3 +221,31 @@ def read_following(
     user_id: UUID = Depends(get_current_user_id),
 ):
     return SuccessResponse(data=follow_list(target_id, user_id, "following", cursor, limit, q))
+
+
+# ---------------------------------------------------------------- E18
+
+@router.post("/{target_id}/block")
+def post_block(target_id: UUID, user_id: UUID = Depends(get_current_user_id)):
+    return SuccessResponse(data=block_user(user_id, target_id))
+
+
+@router.delete("/{target_id}/block")
+def delete_block(target_id: UUID, user_id: UUID = Depends(get_current_user_id)):
+    return SuccessResponse(data=unblock_user(user_id, target_id))
+
+
+@router.post("/{target_id}/hide")
+def post_hide(target_id: UUID, user_id: UUID = Depends(get_current_user_id)):
+    return SuccessResponse(data=hide_user(user_id, target_id))
+
+
+@router.delete("/{target_id}/hide")
+def delete_hide(target_id: UUID, user_id: UUID = Depends(get_current_user_id)):
+    return SuccessResponse(data=unhide_user(user_id, target_id))
+
+
+@router.post("/{target_id}/report")
+def post_report_user(target_id: UUID, body: ReportRequest,
+                     user_id: UUID = Depends(get_current_user_id)):
+    return SuccessResponse(data=report_user(user_id, target_id, body.reason, body.note))
