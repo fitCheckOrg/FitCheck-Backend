@@ -10,6 +10,7 @@ from typing import Literal
 from datetime import datetime, timezone
 from shared.dependencies import get_current_user_id
 from shared.models.enums import DiscoverCategory
+from pipelines.users_pipeline import build_users, unknown_user
 
 
 
@@ -46,7 +47,7 @@ class EditPostRequest(BaseModel):
 
 @router.get("/health")
 async def health():
-    return { "service": "social", "version": "1.8.0", "status": "healthy" }
+    return { "service": "social", "version": "1.10.0", "status": "healthy" }
 
 
 @router.post("/follow/{target_user_id}", response_model=SuccessResponse)
@@ -448,11 +449,11 @@ def _decorate_posts(outfits: list[dict], user_id: str) -> None:
     all_item_ids = list({item_id for o in outfits for item_id in (o.get("item_ids") or [])})
 
     reaction_counts_by_outfit = _get_bulk_reaction_counts(outfit_ids)
-    creator_profiles = _get_bulk_creator_profiles(creator_ids)
+    creators = build_users(creator_ids, user_id)
     item_details = _get_bulk_item_details(all_item_ids)
     my_reactions = _get_bulk_my_reactions(outfit_ids, user_id)
     my_saved = _get_bulk_saved_status(outfit_ids, user_id)
-    my_following = _get_bulk_following_status(creator_ids, user_id)
+    my_collections = _get_bulk_collection_ids(outfit_ids, user_id)
 
     for outfit in outfits:
         oid = outfit["outfit_id"]
@@ -462,10 +463,9 @@ def _decorate_posts(outfits: list[dict], user_id: str) -> None:
         outfit["reaction_counts"] = counts
         outfit["total_reactions"] = sum(counts.values())
 
-        creator = dict(creator_profiles.get(creator_id, {
-            "user_id": creator_id, "display_name": None, "avatar_url": None
-        }))
-        creator["is_following"] = creator_id in my_following
+        # B9: the shared user shape {user_id, display_name, handle,
+        # avatar_url (null), is_following, is_me} - see users_pipeline.
+        creator = creators.get(str(creator_id)) or unknown_user(creator_id, user_id)
         outfit["creator"] = creator
 
         item_ids = outfit.get("item_ids") or []
@@ -485,7 +485,9 @@ def _decorate_posts(outfits: list[dict], user_id: str) -> None:
 
         outfit["my_reaction"] = my_reactions.get(oid)
         outfit["is_saved"] = oid in my_saved
-        outfit["is_following_creator"] = creator_id in my_following
+        # A7: which of the VIEWER's collections already hold this post.
+        outfit["collection_ids"] = my_collections.get(oid, [])
+        outfit["is_following_creator"] = creator["is_following"]
         outfit["is_mine"] = creator_id == user_id
 
         outfit["comment_count"] = 0
@@ -702,36 +704,6 @@ def _get_bulk_reaction_counts(outfit_ids: list[str]) -> dict[str, dict]:
             counts_by_outfit[oid][r] += 1
 
     return counts_by_outfit
-def _get_bulk_creator_profiles(user_ids: list[str]) -> dict[str, dict]:
-    """
-    Fetch creator display info in one bulk query (profiles: id, full_name).
-
-    avatar_url is ALWAYS None on purpose (AV-7 privacy decision, 2026-10-25):
-    the try-on avatar is the user's full-body photo, uploaded for a private
-    try-on experience. Publishing an outfit is not consent to show that
-    photo to other users. A public profile picture will be a separate
-    feature with its own explicit upload and visibility rules. Flutter
-    shows the creator's initials when avatar_url is null.
-    """
-    if not user_ids:
-        return {}
-
-    profiles_result = supabase.table("profiles")\
-        .select("id, full_name")\
-        .in_("id", user_ids)\
-        .execute()
-
-    creators = {}
-    for row in (profiles_result.data or []):
-        uid = row["id"]
-        creators[uid] = {
-            "user_id": uid,
-            "display_name": row.get("full_name"),
-            "avatar_url": None
-        }
-
-    return creators
-
 def _get_bulk_item_details(item_ids: list[str]) -> dict[str, dict]:
     """
     Fetch the public piece info for many wardrobe items in one query.
@@ -786,18 +758,23 @@ def _get_bulk_saved_status(outfit_ids: list[str], user_id: str) -> set[str]:
     return {row["outfit_id"] for row in (result.data or [])}
 
 
-def _get_bulk_following_status(creator_ids: list[str], user_id: str) -> set[str]:
-    """Fetch which of these creators the current user follows, in one query."""
-    if not creator_ids:
-        return set()
+def _get_bulk_collection_ids(outfit_ids: list[str], user_id: str) -> dict[str, list[str]]:
+    """A7: post_id -> ids of the viewer's collections that contain it (one query)."""
+    if not outfit_ids:
+        return {}
 
-    result = supabase.table("follows")\
-        .select("following_id")\
-        .eq("follower_id", user_id)\
-        .in_("following_id", creator_ids)\
+    result = supabase.table("collection_entries")\
+        .select("post_id, collection_id")\
+        .eq("user_id", user_id)\
+        .in_("post_id", outfit_ids)\
         .execute()
 
-    return {row["following_id"] for row in (result.data or [])}
+    found: dict[str, list[str]] = {}
+    for row in (result.data or []):
+        found.setdefault(row["post_id"], []).append(row["collection_id"])
+    return found
+
+
 @router.post("/save/{outfit_id}", response_model=SuccessResponse)
 async def save_outfit_bookmark(
     outfit_id: UUID,

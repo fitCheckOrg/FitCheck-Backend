@@ -10,13 +10,19 @@ Swapping provider (another fal model, FASHN direct, self-hosted CatVTON)
 means adding a new TryOnRenderer subclass and changing get_renderer().
 Nothing else in the backend, and nothing in Flutter, changes.
 
+B-TRY-1 (2026-11-03): every download (input photos and the finished render)
+goes through _get_with_retry, so a short network drop (DNS getaddrinfo
+failure, connection reset, timeout, 5xx) no longer wastes a paid render.
+
 Smoke test (server must be running on :8000):
     python -m tryon.vto_renderer
 """
 
 import base64
 import io
+import logging
 import os
+import time
 from abc import ABC, abstractmethod
 from pathlib import Path
 from typing import Union
@@ -24,9 +30,15 @@ from typing import Union
 import requests
 from PIL import Image
 
+logger = logging.getLogger(__name__)
+
 ImageInput = Union[Image.Image, bytes, str]
 
 VALID_CATEGORIES = {"tops", "bottoms", "one-pieces", "auto"}
+
+DOWNLOAD_ATTEMPTS = 4          # 1 try + 3 retries
+DOWNLOAD_TIMEOUT = 30          # seconds per attempt
+RETRY_WAITS = (2, 4, 8)        # seconds to wait before retry 1, 2, 3
 
 
 class TryOnRenderError(Exception):
@@ -49,15 +61,43 @@ def _ensure_fal_key():
     raise TryOnRenderError("FAL_KEY is not set (checked environment and .env)")
 
 
-def _to_pil(img: ImageInput) -> Image.Image:
+def _get_with_retry(url: str, what: str) -> bytes:
+    """
+    GET an image with retries on network hiccups and 5xx.
+    4xx (e.g. 403/404 - the file really isn't there) fails at once.
+    """
+    last_error = None
+    for attempt in range(1, DOWNLOAD_ATTEMPTS + 1):
+        try:
+            r = requests.get(url, timeout=DOWNLOAD_TIMEOUT)
+            if r.status_code == 200:
+                if attempt > 1:
+                    logger.info("%s download succeeded on attempt %d", what, attempt)
+                return r.content
+            if r.status_code < 500:
+                raise TryOnRenderError(f"could not download {what} ({r.status_code})")
+            last_error = f"HTTP {r.status_code}"
+        except (requests.ConnectionError, requests.Timeout) as exc:
+            last_error = f"{type(exc).__name__}: {exc}"
+
+        if attempt < DOWNLOAD_ATTEMPTS:
+            wait = RETRY_WAITS[min(attempt - 1, len(RETRY_WAITS) - 1)]
+            logger.warning("%s download failed (attempt %d/%d): %s - retrying in %ds",
+                           what, attempt, DOWNLOAD_ATTEMPTS, last_error, wait)
+            time.sleep(wait)
+
+    raise TryOnRenderError(
+        f"could not download {what} after {DOWNLOAD_ATTEMPTS} attempts: {last_error}"
+    )
+
+
+def _to_pil(img: ImageInput, what: str = "image") -> Image.Image:
     if isinstance(img, Image.Image):
         return img
     if isinstance(img, (bytes, bytearray)):
         return Image.open(io.BytesIO(img))
     if isinstance(img, str) and img.startswith("http"):
-        r = requests.get(img, timeout=60)
-        r.raise_for_status()
-        return Image.open(io.BytesIO(r.content))
+        return Image.open(io.BytesIO(_get_with_retry(img, what)))
     raise TypeError(f"Unsupported image input: {type(img)}")
 
 
@@ -115,8 +155,8 @@ class FalFashnRenderer(TryOnRenderer):
         _ensure_fal_key()
         import fal_client  # imported after FAL_KEY is guaranteed
 
-        person = _to_pil(person_image).convert("RGB")
-        garment = _flatten_on_white(_to_pil(garment_image))
+        person = _to_pil(person_image, "person photo").convert("RGB")
+        garment = _flatten_on_white(_to_pil(garment_image, "garment photo"))
 
         try:
             result = fal_client.subscribe(
@@ -139,10 +179,9 @@ class FalFashnRenderer(TryOnRenderer):
         if not images or not images[0].get("url"):
             raise TryOnRenderError(f"{self.name} returned no image: {result}")
 
-        r = requests.get(images[0]["url"], timeout=60)
-        if r.status_code != 200:
-            raise TryOnRenderError(f"could not download result ({r.status_code})")
-        return r.content
+        # The render is already paid for at this point - retry the download
+        # instead of failing and making the user render (and pay) again.
+        return _get_with_retry(images[0]["url"], "try-on result")
 
 
 # ---------------------------------------------------------------- factory
@@ -155,7 +194,7 @@ def get_renderer() -> TryOnRenderer:
 # ---------------------------------------------------------------- smoke test
 
 if __name__ == "__main__":
-    import time
+    import time as _time
 
     USER = "f4b5f129-db34-40e5-8423-d1b256a15578"
     GARMENT = "a852b031-a407-49db-9df6-7e22ecac2ea6"
@@ -169,7 +208,7 @@ if __name__ == "__main__":
     garment = _data(f"{API}/wardrobe/{GARMENT}?user_id={USER}")
 
     renderer = get_renderer()
-    t0 = time.time()
+    t0 = _time.time()
     png = renderer.render(avatar["original_photo_url"], garment["clean_image_url"], "tops")
     out = Path("outputs/vto_spike/renderer_smoke.png")
     out.parent.mkdir(parents=True, exist_ok=True)

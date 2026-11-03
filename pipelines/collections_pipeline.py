@@ -1,5 +1,6 @@
 """
-Collections (COL-1) - named, private folders of saved looks and saved outfits.
+Collections (COL-1) - named, private folders of saved looks, saved outfits
+and (A7, 2026-10-31) saved Discover posts.
 
 Optional on top of saving: a look/outfit is saved first, then (optionally)
 filed into one or more collections.
@@ -7,13 +8,17 @@ filed into one or more collections.
 Tables (see sql/collections.sql):
     collections         (collection_id, user_id, name, created_at, updated_at)
                         unique (user_id, lower(btrim(name)))
-    collection_entries  (entry_id, collection_id, user_id, look_id | outfit_id, added_at)
-                        exactly one of look_id / outfit_id; FKs ON DELETE CASCADE
+    collection_entries  (entry_id, collection_id, user_id, look_id | outfit_id | post_id, added_at)
+                        exactly one of the three. look_id / outfit_id: FK ON DELETE CASCADE.
+                        post_id: NO foreign key on purpose - a post entry is kept when the
+                        post is unpublished or deleted and shown as {unavailable: true}.
 
 Rules:
     * one look/outfit can be in several collections
     * deleting a collection never deletes its looks/outfits
     * deleting a look/outfit removes it from every collection (DB cascade)
+    * a post entry stays when the post goes away -> {"unavailable": true}
+    * adding a post to a collection also bookmarks it (saved_outfits)
     * name 1-40 chars after trimming, unique per user (case-insensitive)
     * every query is scoped to the user - another user's ids give 404
 """
@@ -35,7 +40,7 @@ ENTRIES = "collection_entries"
 MAX_NAME_LEN = 40
 MAX_COLLECTIONS = 100
 MAX_PAGE = 100
-ENTRY_TYPES = {"look": "look_id", "outfit": "outfit_id"}
+ENTRY_TYPES = {"look": "look_id", "outfit": "outfit_id", "post": "post_id"}
 
 
 # ---------------------------------------------------------------- errors
@@ -79,7 +84,7 @@ def _entry_column(entry_type: str) -> str:
     col = ENTRY_TYPES.get(str(entry_type or "").lower())
     if not col:
         raise FitCheckException(
-            "entry_type must be 'look' or 'outfit'.",
+            "entry_type must be 'look', 'outfit' or 'post'.",
             code="INVALID_ENTRY_TYPE", status_code=400,
         )
     return col
@@ -148,7 +153,33 @@ def _summaries(uid: str, rows: list[dict]) -> list[dict]:
     return out
 
 
+def _post_visible(uid: str, post_id: str) -> bool:
+    """Only a published (public) post can be filed as a post - yours or anyone's.
+    Your own unpublished outfit goes into a collection as entry_type "outfit"."""
+    res = supabase.table("outfits").select("outfit_id, is_public")\
+        .eq("outfit_id", post_id).limit(1).execute()
+    row = res.data[0] if res.data else None
+    return bool(row and row.get("is_public"))
+
+
+def _bookmark_post(uid: str, post_id: str) -> None:
+    """A7: filing a post into a collection also turns its social bookmark on."""
+    existing = supabase.table("saved_outfits").select("outfit_id")\
+        .eq("user_id", uid).eq("outfit_id", post_id).limit(1).execute()
+    if existing.data:
+        return
+    try:
+        supabase.table("saved_outfits").insert({"user_id": uid, "outfit_id": post_id}).execute()
+    except APIError as exc:
+        if not _is_unique_violation(exc):
+            raise
+
+
 def _check_target_owned(uid: str, entry_type: str, entry_id: str) -> None:
+    if entry_type == "post":
+        if not _post_visible(uid, entry_id):
+            raise _not_found("POST_NOT_FOUND", "This post isn't available.")
+        return
     if entry_type == "look":
         res = supabase.table("tryon_looks").select("look_id")\
             .eq("look_id", entry_id).eq("user_id", uid).limit(1).execute()
@@ -252,7 +283,7 @@ def list_entries(user_id: UUID, collection_id: UUID,
     limit = max(1, min(int(limit), MAX_PAGE))
     offset = max(0, int(offset))
 
-    entries = supabase.table(ENTRIES).select("look_id, outfit_id, added_at")\
+    entries = supabase.table(ENTRIES).select("look_id, outfit_id, post_id, added_at")\
         .eq("collection_id", cid).eq("user_id", uid)\
         .order("added_at", desc=True)\
         .range(offset, offset + limit - 1)\
@@ -260,6 +291,7 @@ def list_entries(user_id: UUID, collection_id: UUID,
 
     look_ids = [e["look_id"] for e in entries if e.get("look_id")]
     outfit_ids = [e["outfit_id"] for e in entries if e.get("outfit_id")]
+    post_ids = [e["post_id"] for e in entries if e.get("post_id")]
 
     looks = {}
     if look_ids:
@@ -273,14 +305,40 @@ def list_entries(user_id: UUID, collection_id: UUID,
             .eq("user_id", uid).in_("outfit_id", outfit_ids).execute().data or []
         outfits = {r["outfit_id"]: r for r in rows}
 
+    posts = _load_posts(post_ids, uid) if post_ids else {}
+
     out = []
     for e in entries:
         if e.get("look_id") and e["look_id"] in looks:
             out.append({"entry_type": "look", "added_at": e["added_at"], "look": looks[e["look_id"]]})
         elif e.get("outfit_id") and e["outfit_id"] in outfits:
             out.append({"entry_type": "outfit", "added_at": e["added_at"], "outfit": outfits[e["outfit_id"]]})
+        elif e.get("post_id"):
+            pid = e["post_id"]
+            if pid in posts:
+                out.append({"entry_type": "post", "entry_id": pid,
+                            "added_at": e["added_at"], "post": posts[pid]})
+            else:
+                # Unpublished, deleted, or no longer visible: keep the entry,
+                # send no post data. The app shows "No longer available".
+                out.append({"entry_type": "post", "entry_id": pid,
+                            "added_at": e["added_at"], "unavailable": True})
 
     return {"entries": out, "limit": limit, "offset": offset}
+
+
+def _load_posts(post_ids: list[str], uid: str) -> dict[str, dict]:
+    """Published posts in the Discover feed shape. A post that isn't public any
+    more (unpublished or deleted) is left out -> the entry shows as unavailable,
+    for everyone including its owner (their outfit is still in their Lookbook)."""
+    # Imported here to avoid a circular import (api.social is the post owner).
+    from api.social import FEED_FIELDS, _decorate_posts
+
+    rows = supabase.table("outfits").select(FEED_FIELDS)\
+        .in_("outfit_id", post_ids).execute().data or []
+    rows = [r for r in rows if r.get("is_public")]
+    _decorate_posts(rows, uid)
+    return {r["outfit_id"]: r for r in rows}
 
 
 def add_entry(user_id: UUID, collection_id: UUID, entry_type: str,
@@ -296,6 +354,9 @@ def add_entry(user_id: UUID, collection_id: UUID, entry_type: str,
         res = supabase.table(ENTRIES).select("added_at")\
             .eq("collection_id", cid).eq(col, eid).limit(1).execute()
         return res.data[0] if res.data else None
+
+    if etype == "post":
+        _bookmark_post(uid, eid)
 
     found = _existing()
     if found:
