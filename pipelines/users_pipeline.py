@@ -1,6 +1,6 @@
 """
 Users (Discover part 2): B9 handles (2026-10-31), B10 public profiles (2026-11-02),
-B10.4 public profile photo (2026-11-03).
+B10.4 public profile photo (2026-11-03), B11 follow lists (2026-11-03).
 
 One place that builds the public `user` object every social response uses:
     {user_id, display_name, handle, avatar_url, avatar_url_small, is_following, is_me}
@@ -56,6 +56,7 @@ STYLE_TAGS = ("casual", "formal", "streetwear", "business", "athletic", "vintage
 CITY_RE = re.compile(r"^[^\W\d_](?:[^\W\d_]|[\u0300-\u036f]|[ .'\-])*$", re.UNICODE)
 DEFAULT_PAGE = 20
 MAX_PAGE = 50
+SEARCH_MATCH_CAP = 300      # B11 ?q=: at most this many name/handle matches are checked
 
 
 # ---------------------------------------------------------------- errors
@@ -386,3 +387,73 @@ def user_posts(target_id, viewer_id, cursor: str | None = None,
         last = rows[-1]
         next_cursor = _encode_cursor(str(last[col]), str(last["outfit_id"]))
     return {"items": rows, "next_cursor": next_cursor}
+
+
+# ---------------------------------------------------------------- B11 follow lists
+
+def _search_term(raw) -> str:
+    """'@Ada O' -> 'ada o'. Only letters, digits, space and _ . ' - are kept
+    (anything else could break the PostgREST filter)."""
+    term = str(raw or "").strip().lstrip("@").strip().lower()
+    term = re.sub(r"[^\w .'\-]", "", term, flags=re.UNICODE)
+    return " ".join(term.split())[:40]
+
+
+def _matching_profile_ids(term: str) -> list[str]:
+    """Profiles whose handle starts with the term, or whose name (any word) starts with it."""
+    res = supabase.table("profiles").select("id")\
+        .or_(f'handle.ilike."{term}*",full_name.ilike."{term}*",full_name.ilike."* {term}*"')\
+        .limit(SEARCH_MATCH_CAP).execute()
+    return [str(r["id"]) for r in (res.data or [])]
+
+
+def follow_list(target_id, viewer_id, direction: str, cursor: str | None = None,
+                limit: int = DEFAULT_PAGE, q: str | None = None) -> dict:
+    """
+    B11 - direction 'followers' (people who follow target) or 'following'
+    (people target follows). Newest follow first, keyset paging on
+    (follows.created_at, person id). is_following is from the VIEWER's side.
+    """
+    uid, viewer = str(target_id), str(viewer_id)
+    if not _profile_row(uid):
+        raise _user_not_found()
+    limit = max(1, min(int(limit), MAX_PAGE))
+    if direction == "followers":
+        match_col, person_col = "following_id", "follower_id"
+    else:
+        match_col, person_col = "follower_id", "following_id"
+
+    query = supabase.table("follows").select(f"{person_col}, created_at").eq(match_col, uid)
+
+    term = _search_term(q) if q else ""
+    if term:
+        ids = _matching_profile_ids(term)
+        if not ids:
+            return {"items": [], "next_cursor": None}
+        query = query.in_(person_col, ids)
+
+    if cursor:
+        ts, pid = _decode_cursor(cursor)
+        query = query.or_(f'created_at.lt."{ts}",and(created_at.eq."{ts}",{person_col}.lt.{pid})')
+
+    rows = query.order("created_at", desc=True).order(person_col, desc=True)\
+        .limit(limit + 1).execute().data or []
+    has_more = len(rows) > limit
+    rows = rows[:limit]
+
+    people = build_users([r[person_col] for r in rows], viewer)
+    items = [people.get(str(r[person_col])) or unknown_user(r[person_col], viewer) for r in rows]
+
+    next_cursor = None
+    if has_more and rows:
+        last = rows[-1]
+        next_cursor = _encode_cursor(str(last["created_at"]), str(last[person_col]))
+    return {"items": items, "next_cursor": next_cursor}
+
+
+def remove_follower(user_id, follower_id) -> dict:
+    """B11 - stop someone following me. Idempotent (200 even if they didn't)."""
+    supabase.table("follows").delete()\
+        .eq("follower_id", str(follower_id)).eq("following_id", str(user_id)).execute()
+    logger.info("follower removed user=%s follower=%s", user_id, follower_id)
+    return {"removed": True, "user_id": str(follower_id)}

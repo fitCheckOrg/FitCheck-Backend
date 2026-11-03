@@ -21,6 +21,12 @@ POST   /api/users/me/photo   multipart: photo (file), crop_x?, crop_y?, crop_siz
 DELETE /api/users/me/photo
   -> {avatar_url, avatar_url_small}
 
+B11 follow lists (2026-11-03):
+GET    /api/users/{user_id}/followers?cursor=&limit=&q=   -> {items: [user], next_cursor}
+GET    /api/users/{user_id}/following?cursor=&limit=&q=   -> {items: [user], next_cursor}
+GET    /api/users/me/followers | /api/users/me/following  (same, for yourself)
+DELETE /api/users/me/followers/{user_id}                   -> {removed: true, user_id}
+
 Errors: 400 HANDLE_INVALID | 400 HANDLE_RESERVED | 409 HANDLE_TAKEN |
         429 HANDLE_CHANGE_TOO_SOON | 404 USER_NOT_FOUND |
         400 BIO_TOO_LONG | 400 CITY_INVALID | 400 STYLE_TAG_INVALID | 400 INVALID_CURSOR |
@@ -37,6 +43,7 @@ from shared.models.responses import SuccessResponse
 from pipelines.users_pipeline import (
     check_available, get_me, set_handle, get_by_handle,
     public_profile, public_profile_by_handle, update_public_profile, user_posts,
+    follow_list, remove_follower,
 )
 from pipelines.profile_photo_pipeline import upload_profile_photo, delete_profile_photo, MAX_BYTES
 
@@ -55,7 +62,7 @@ class UpdatePublicProfileRequest(BaseModel):
 
 @router.get("/health")
 def health():
-    return {"service": "users", "version": "1.2.0", "status": "healthy"}
+    return {"service": "users", "version": "1.3.0", "status": "healthy"}
 
 
 @router.get("/handle-available")
@@ -102,6 +109,34 @@ def delete_my_photo(user_id: UUID = Depends(get_current_user_id)):
     return SuccessResponse(data=delete_profile_photo(user_id))
 
 
+# ---------------------------------------------------------------- B11 (me)
+# Declared before the /{target_id}/... routes.
+
+@router.get("/me/followers")
+def read_my_followers(
+    cursor: str | None = Query(None),
+    limit: int = Query(20, ge=1, le=50),
+    q: str | None = Query(None, max_length=40),
+    user_id: UUID = Depends(get_current_user_id),
+):
+    return SuccessResponse(data=follow_list(user_id, user_id, "followers", cursor, limit, q))
+
+
+@router.get("/me/following")
+def read_my_following(
+    cursor: str | None = Query(None),
+    limit: int = Query(20, ge=1, le=50),
+    q: str | None = Query(None, max_length=40),
+    user_id: UUID = Depends(get_current_user_id),
+):
+    return SuccessResponse(data=follow_list(user_id, user_id, "following", cursor, limit, q))
+
+
+@router.delete("/me/followers/{follower_id}")
+def delete_my_follower(follower_id: UUID, user_id: UUID = Depends(get_current_user_id)):
+    return SuccessResponse(data=remove_follower(user_id, follower_id))
+
+
 # ---------------------------------------------------------------- B10
 
 @router.get("/me/public")
@@ -137,3 +172,27 @@ def read_user_posts(
     user_id: UUID = Depends(get_current_user_id),
 ):
     return SuccessResponse(data=user_posts(target_id, user_id, cursor, limit, include_private))
+
+
+# ---------------------------------------------------------------- B11
+
+@router.get("/{target_id}/followers")
+def read_followers(
+    target_id: UUID,
+    cursor: str | None = Query(None),
+    limit: int = Query(20, ge=1, le=50),
+    q: str | None = Query(None, max_length=40),
+    user_id: UUID = Depends(get_current_user_id),
+):
+    return SuccessResponse(data=follow_list(target_id, user_id, "followers", cursor, limit, q))
+
+
+@router.get("/{target_id}/following")
+def read_following(
+    target_id: UUID,
+    cursor: str | None = Query(None),
+    limit: int = Query(20, ge=1, le=50),
+    q: str | None = Query(None, max_length=40),
+    user_id: UUID = Depends(get_current_user_id),
+):
+    return SuccessResponse(data=follow_list(target_id, user_id, "following", cursor, limit, q))

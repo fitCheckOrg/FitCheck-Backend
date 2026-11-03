@@ -10,7 +10,9 @@ from typing import Literal
 from datetime import datetime, timezone
 from shared.dependencies import get_current_user_id
 from shared.models.enums import DiscoverCategory
-from pipelines.users_pipeline import build_users, unknown_user
+from pipelines.users_pipeline import (
+    build_users, unknown_user, _following_set, _encode_cursor, _decode_cursor,
+)
 
 
 
@@ -47,7 +49,7 @@ class EditPostRequest(BaseModel):
 
 @router.get("/health")
 async def health():
-    return { "service": "social", "version": "1.10.0", "status": "healthy" }
+    return { "service": "social", "version": "1.11.0", "status": "healthy" }
 
 
 @router.post("/follow/{target_user_id}", response_model=SuccessResponse)
@@ -224,7 +226,9 @@ async def react_to_outfit(
         .upsert({
             "outfit_id": str(outfit_id),
             "user_id": str(user_id),
-            "reaction": body.reaction
+            "reaction": body.reaction,
+            # B12: reacted_at = when you last reacted / changed reaction.
+            "created_at": datetime.now(timezone.utc).isoformat(),
         }, on_conflict="outfit_id,user_id")\
         .execute()
 
@@ -448,8 +452,10 @@ def _decorate_posts(outfits: list[dict], user_id: str) -> None:
     creator_ids = list({o["user_id"] for o in outfits})
     all_item_ids = list({item_id for o in outfits for item_id in (o.get("item_ids") or [])})
 
-    reaction_counts_by_outfit = _get_bulk_reaction_counts(outfit_ids)
-    creators = build_users(creator_ids, user_id)
+    reaction_counts_by_outfit, reactors_by_outfit = _get_bulk_reactions(outfit_ids)
+    previews = _pick_reacted_by_previews(reactors_by_outfit, user_id)
+    preview_ids = {u for ids in previews.values() for u in ids}
+    creators = build_users(list(set(creator_ids) | preview_ids), user_id)
     item_details = _get_bulk_item_details(all_item_ids)
     my_reactions = _get_bulk_my_reactions(outfit_ids, user_id)
     my_saved = _get_bulk_saved_status(outfit_ids, user_id)
@@ -484,6 +490,11 @@ def _decorate_posts(outfits: list[dict], user_id: str) -> None:
         outfit["image_count"] = len(item_ids)
 
         outfit["my_reaction"] = my_reactions.get(oid)
+        # B12: up to 2 OTHER people who reacted - people I follow first,
+        # then the most recent. Never me (my_reaction covers me).
+        outfit["reacted_by_preview"] = [
+            creators.get(u) or unknown_user(u, user_id) for u in previews.get(oid, [])
+        ]
         outfit["is_saved"] = oid in my_saved
         # A7: which of the VIEWER's collections already hold this post.
         outfit["collection_ids"] = my_collections.get(oid, [])
@@ -521,6 +532,71 @@ async def get_post(
     posts = result.data
     _decorate_posts(posts, str(user_id))
     return SuccessResponse(data=posts[0])
+
+
+# ---------------------------------------------------------------- B12 who reacted
+
+@router.get("/posts/{post_id}/reactions", response_model=SuccessResponse)
+async def get_post_reactors(
+    post_id: UUID,
+    type: str | None = Query(None),
+    cursor: str | None = Query(None),
+    limit: int = Query(30, ge=1, le=50),
+    user_id: UUID = Depends(get_current_user_id)
+):
+    """
+    B12: who reacted. totals = counts per type + all (never filtered by `type`).
+    items newest first; on the first page MY row comes first (if I reacted,
+    and it matches `type`). Keyset cursor on (reacted_at, user_id).
+    """
+    pid, me = str(post_id), str(user_id)
+    post = supabase.table("outfits").select("outfit_id, user_id, is_public")\
+        .eq("outfit_id", pid).limit(1).execute().data
+    if not post or not (post[0].get("is_public") or str(post[0].get("user_id")) == me):
+        raise FitCheckException(
+            "This post isn't available.", code="POST_NOT_FOUND", status_code=404
+        )
+    if type is not None and type not in VALID_REACTIONS:
+        raise FitCheckException(
+            f"Invalid reaction. Must be one of: {', '.join(REACTION_TYPES)}.",
+            code="INVALID_REACTION", status_code=400
+        )
+
+    counts = _get_reaction_counts(pid)["reaction_counts"]
+    totals = {**counts, "all": sum(counts.values())}
+
+    query = supabase.table("outfit_reactions")\
+        .select("user_id, reaction, created_at")\
+        .eq("outfit_id", pid).neq("user_id", me)
+    if type:
+        query = query.eq("reaction", type)
+    if cursor:
+        ts, uid = _decode_cursor(cursor)
+        query = query.or_(f'created_at.lt."{ts}",and(created_at.eq."{ts}",user_id.lt.{uid})')
+    rows = query.order("created_at", desc=True).order("user_id", desc=True)\
+        .limit(limit + 1).execute().data or []
+    has_more = len(rows) > limit
+    rows = rows[:limit]
+
+    if not cursor:                                   # my row first, first page only
+        mine = supabase.table("outfit_reactions")\
+            .select("user_id, reaction, created_at")\
+            .eq("outfit_id", pid).eq("user_id", me).limit(1).execute().data
+        if mine and (not type or mine[0]["reaction"] == type):
+            rows = mine + rows
+
+    people = build_users([r["user_id"] for r in rows], me)
+    items = [{
+        "user": people.get(str(r["user_id"])) or unknown_user(r["user_id"], me),
+        "reaction_type": r["reaction"],
+        "reacted_at": r["created_at"],
+    } for r in rows]
+
+    next_cursor = None
+    if has_more:
+        last = rows[-1]
+        next_cursor = _encode_cursor(str(last["created_at"]), str(last["user_id"]))
+    return SuccessResponse(data={"totals": totals, "items": items, "next_cursor": next_cursor})
 
 
 def _clean_caption(caption) -> str | None:
@@ -685,25 +761,43 @@ def _apply_score_visibility(outfit: dict) -> None:
         outfit["overall_grade"] = None
 
 
-def _get_bulk_reaction_counts(outfit_ids: list[str]) -> dict[str, dict]:
-    """Fetch reaction counts for multiple outfits in one query, grouped by outfit_id."""
+PREVIEW_SIZE = 2
+
+
+def _get_bulk_reactions(outfit_ids: list[str]) -> tuple[dict[str, dict], dict[str, list[str]]]:
+    """One query: counts by type per outfit, and reactor user_ids per outfit (newest first)."""
+    counts: dict[str, dict] = {oid: _empty_counts() for oid in outfit_ids}
+    reactors: dict[str, list[str]] = {oid: [] for oid in outfit_ids}
     if not outfit_ids:
-        return {}
+        return counts, reactors
 
-    result = supabase.table("outfit_reactions")\
-        .select("outfit_id, reaction")\
+    rows = supabase.table("outfit_reactions")\
+        .select("outfit_id, user_id, reaction, created_at")\
         .in_("outfit_id", outfit_ids)\
-        .execute()
+        .order("created_at", desc=True)\
+        .execute().data or []
 
-    counts_by_outfit: dict[str, dict] = {oid: _empty_counts() for oid in outfit_ids}
+    for row in rows:
+        oid, r = row["outfit_id"], row["reaction"]
+        if oid in counts and r in counts[oid]:
+            counts[oid][r] += 1
+            reactors[oid].append(str(row["user_id"]))
+    return counts, reactors
 
-    for row in (result.data or []):
-        oid = row["outfit_id"]
-        r = row["reaction"]
-        if oid in counts_by_outfit and r in counts_by_outfit[oid]:
-            counts_by_outfit[oid][r] += 1
 
-    return counts_by_outfit
+def _pick_reacted_by_previews(reactors_by_outfit: dict[str, list[str]],
+                              viewer_id: str) -> dict[str, list[str]]:
+    """Per outfit: up to PREVIEW_SIZE reactor ids, people the viewer follows first."""
+    everyone = list({u for ids in reactors_by_outfit.values() for u in ids if u != viewer_id})
+    followed = _following_set(viewer_id, everyone)
+    out = {}
+    for oid, ids in reactors_by_outfit.items():
+        others = [u for u in ids if u != viewer_id]
+        ordered = [u for u in others if u in followed] + [u for u in others if u not in followed]
+        out[oid] = ordered[:PREVIEW_SIZE]
+    return out
+
+
 def _get_bulk_item_details(item_ids: list[str]) -> dict[str, dict]:
     """
     Fetch the public piece info for many wardrobe items in one query.
