@@ -17,6 +17,10 @@ from pipelines.safety_pipeline import (
     excluded_user_ids, is_blocked_either_way, not_interested_post_ids, not_in,
     mark_not_interested, unmark_not_interested, report_post,
 )
+from pipelines.comments_pipeline import bulk_comment_summary
+from pipelines.activity_pipeline import record, record_reaction
+from pipelines.insights_pipeline import bulk_share_counts
+from pipelines.share_page_pipeline import share_url
 
 
 
@@ -44,6 +48,7 @@ class PublishPostRequest(BaseModel):
     caption: str | None = None
     category: DiscoverCategory | None = None
     show_score: bool = True
+    comments_enabled: bool = True
 
 
 class ReportRequest(BaseModel):
@@ -55,10 +60,11 @@ class EditPostRequest(BaseModel):
     caption: str | None = None
     category: DiscoverCategory | None = None
     show_score: bool | None = None
+    comments_enabled: bool | None = None
 
 @router.get("/health")
 async def health():
-    return { "service": "social", "version": "1.12.0", "status": "healthy" }
+    return { "service": "social", "version": "1.16.0", "status": "healthy" }
 
 
 @router.post("/follow/{target_user_id}", response_model=SuccessResponse)
@@ -112,6 +118,8 @@ async def follow_user(
         raise FitCheckException(
             "Failed to follow user.", code="DATABASE_ERROR", status_code=500
         )
+
+    record(target_user_id, user_id, "followed")              # D15
 
     counts = _get_follow_counts(str(target_user_id))
 
@@ -228,7 +236,7 @@ async def react_to_outfit(
             code="INVALID_REACTION", status_code=400
         )
 
-    _require_visible_outfit(str(outfit_id), str(user_id))
+    post = _require_visible_outfit(str(outfit_id), str(user_id))
 
     logger.info(f"React - outfit={outfit_id} user={user_id} reaction={body.reaction}")
 
@@ -248,6 +256,8 @@ async def react_to_outfit(
         )
 
     counts = _get_reaction_counts(str(outfit_id))
+    record_reaction(post["user_id"], user_id, str(outfit_id), body.reaction,
+                    counts["total_reactions"])                # D15
 
     return SuccessResponse(data={
         "outfit_id": str(outfit_id),
@@ -307,7 +317,7 @@ async def get_reactions(
     })
 
 
-def _require_visible_outfit(outfit_id: str, user_id: str) -> None:
+def _require_visible_outfit(outfit_id: str, user_id: str) -> dict:
     """404 unless the outfit exists AND is public or belongs to the caller.
     E18: also 404 when it's under review or its creator is blocked either way
     (unless it's the caller's own)."""
@@ -323,6 +333,7 @@ def _require_visible_outfit(outfit_id: str, user_id: str) -> None:
         raise FitCheckException(
             "Outfit not found.", code="OUTFIT_NOT_FOUND", status_code=404
         )
+    return row
 
 
 def _get_reaction_counts(outfit_id: str) -> dict:
@@ -345,7 +356,7 @@ def _get_reaction_counts(outfit_id: str) -> dict:
 FEED_FIELDS = (
     "outfit_id, user_id, overall_score, overall_grade, "
     "item_ids, occasion, name, created_at, published_at, is_public, category, "
-    "caption, ai_highlights, show_score, under_review"
+    "caption, ai_highlights, show_score, under_review, comments_enabled"
 )
 
 
@@ -479,15 +490,18 @@ def _decorate_posts(outfits: list[dict], user_id: str) -> None:
     creator_ids = list({o["user_id"] for o in outfits})
     all_item_ids = list({item_id for o in outfits for item_id in (o.get("item_ids") or [])})
 
+    excluded = excluded_user_ids(user_id) if outfits else set()
     reaction_counts_by_outfit, reactors_by_outfit = _get_bulk_reactions(outfit_ids)
-    previews = _pick_reacted_by_previews(reactors_by_outfit, user_id,
-                                         excluded_user_ids(user_id) if outfits else set())
+    previews = _pick_reacted_by_previews(reactors_by_outfit, user_id, excluded)
+    # C13: comment_count counts top-level comments + replies.
+    comment_counts, top_comments = bulk_comment_summary(outfits, str(user_id), excluded)
     preview_ids = {u for ids in previews.values() for u in ids}
     creators = build_users(list(set(creator_ids) | preview_ids), user_id)
     item_details = _get_bulk_item_details(all_item_ids)
     my_reactions = _get_bulk_my_reactions(outfit_ids, user_id)
     my_saved = _get_bulk_saved_status(outfit_ids, user_id)
     my_collections = _get_bulk_collection_ids(outfit_ids, user_id)
+    share_counts = bulk_share_counts(outfit_ids)                  # E19
 
     for outfit in outfits:
         oid = outfit["outfit_id"]
@@ -529,8 +543,11 @@ def _decorate_posts(outfits: list[dict], user_id: str) -> None:
         outfit["is_following_creator"] = creator["is_following"]
         outfit["is_mine"] = creator_id == user_id
 
-        outfit["comment_count"] = 0
-        outfit["share_count"] = 0
+        outfit["comment_count"] = comment_counts.get(str(oid), 0)
+        outfit["top_comments"] = top_comments.get(str(oid), [])
+        outfit["comments_enabled"] = outfit.get("comments_enabled") is not False
+        outfit["share_count"] = share_counts.get(str(oid), 0)
+        outfit["share_url"] = share_url(oid)                      # E20
 
         _apply_score_visibility(outfit)
 
@@ -699,6 +716,7 @@ async def publish_post(
         "caption": _clean_caption(body.caption),
         "category": body.category.value if body.category else None,
         "show_score": body.show_score,
+        "comments_enabled": body.comments_enabled,
     }
     if not current.get("is_public") or not current.get("published_at"):
         updates["published_at"] = datetime.now(timezone.utc).isoformat()
@@ -734,6 +752,8 @@ async def edit_post(
         updates["category"] = body.category.value if body.category else None
     if "show_score" in sent and body.show_score is not None:
         updates["show_score"] = body.show_score
+    if "comments_enabled" in sent and body.comments_enabled is not None:
+        updates["comments_enabled"] = body.comments_enabled
 
     if updates:
         supabase.table("outfits").update(updates)\
@@ -748,8 +768,8 @@ async def delete_post(
 ):
     """
     A5: take a post off Discover. The outfit itself stays in your Lookbook.
-    Removes the post's reactions and other users' bookmarks of it, and clears
-    caption + published_at. Idempotent: deleting an unpublished outfit is 200.
+    Removes the post's reactions, comments (C13) and other users' bookmarks
+    of it, and clears caption + published_at. Idempotent.
     """
     uid, pid = str(user_id), str(post_id)
     _own_outfit(pid, uid)
@@ -762,6 +782,7 @@ async def delete_post(
         .eq("outfit_id", pid).execute()
     saves = supabase.table("saved_outfits").delete()\
         .eq("outfit_id", pid).neq("user_id", uid).execute()
+    comments = supabase.table("comments").delete().eq("post_id", pid).execute()
 
     logger.info(f"Delete post - outfit={pid} user={uid}")
     return SuccessResponse(data={
@@ -769,6 +790,7 @@ async def delete_post(
         "deleted": True,
         "reactions_removed": len(reactions.data or []),
         "saves_removed": len(saves.data or []),
+        "comments_removed": len(comments.data or []),
     })
 
 

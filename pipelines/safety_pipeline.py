@@ -12,11 +12,11 @@ Rules:
     * BLOCK works both ways: neither side sees the other anywhere (feed, profile,
       posts, lists, reactions, search, ...). Profile -> 404 USER_NOT_FOUND.
       Blocking also unfollows both ways and removes their reactions from my posts
-      (and, from C13, their comments on my posts). Idempotent.
+      and their comments (C13, soft-deleted so other people's replies stay). Idempotent.
     * HIDE is one way and silent: I stop seeing them in feeds and lists.
       Their profile still opens if I go to it.
     * NOT INTERESTED removes one post from all my feeds.
-    * REPORT: one per person per target; a repeat is 200. A post with
+    * REPORT (post, user, comment): one per person per target; a repeat is 200. A post with
       REVIEW_THRESHOLD open reports from different people gets under_review=true
       and is hidden from everyone except its owner.
 """
@@ -137,7 +137,13 @@ def block_user(user_id, target_id) -> dict:
     if post_ids:
         supabase.table("outfit_reactions").delete()\
             .eq("user_id", them).in_("outfit_id", post_ids).execute()
-    # C13: their comments on my posts are removed here too, once comments exist.
+        # C13: and their comments on my posts.
+        theirs = supabase.table("comments").select("comment_id")\
+            .eq("user_id", them).eq("deleted", False).in_("post_id", post_ids).execute().data or []
+        if theirs:
+            supabase.table("comments").update({
+                "text": None, "mentions": [], "deleted": True, "pinned": False,
+            }).in_("comment_id", [c["comment_id"] for c in theirs]).execute()
 
     logger.info("block user=%s blocked=%s", me, them)
     return {"blocked": True, "user_id": them}
@@ -265,4 +271,20 @@ def report_user(user_id, target_id, reason, note=None) -> dict:
     _require_user(them)
     _save_report(me, "user", them, reason, note)
     logger.info("report user=%s by=%s reason=%s", them, me, reason)
+    return {"reported": True}
+
+
+def report_comment(user_id, comment_id, reason, note=None) -> dict:
+    """C13. You can still report a comment after blocking its author."""
+    me, cid = str(user_id), str(comment_id)
+    reason, note = _clean_report(reason, note)
+    res = supabase.table("comments").select("comment_id, user_id, deleted")\
+        .eq("comment_id", cid).limit(1).execute()
+    row = res.data[0] if res.data else None
+    if not row or row.get("deleted"):
+        raise _bad("COMMENT_NOT_FOUND", "This comment isn't available.", 404)
+    if str(row.get("user_id")) == me:
+        raise _bad("CANNOT_REPORT_SELF", "You can't report your own comment.")
+    _save_report(me, "comment", cid, reason, note)
+    logger.info("report comment=%s by=%s reason=%s", cid, me, reason)
     return {"reported": True}
