@@ -8,11 +8,19 @@ Tables (see the NOTE-1 SQL):
                          created_at, expires_at, deleted_at)
                          unique (user_id) where deleted_at is null  -> one live note
     fit_note_reactions  (note_id, user_id, reaction, created_at)  pk (note_id, user_id)
-    function post_fit_note(...)  -> replaces my note in ONE transaction
+    view live_fit_notes          -> deleted_at is null AND expires_at > now()  (DATABASE time)
+    function post_fit_note(...)  -> per-user lock, retire every non-deleted note
+                                    (expired ones too), insert the new one - ONE transaction
+    function react_fit_note(...) -> reaction upsert + bell row in ONE transaction;
+                                    says whether this is a NEW reactor (-> push)
 
 Rules enforced here (not only in the app):
-    * Live = deleted_at is null AND expires_at > now(). Checked in EVERY read and
-      write. Nothing else decides visibility (a cleanup job may delete old rows).
+    * Live = deleted_at is null AND expires_at > now(), using DATABASE time (the
+      live_fit_notes view / the functions). Checked in every read and write.
+      Nothing else decides visibility (a cleanup job may delete old rows).
+    * Authorisation BEFORE expiry: not allowed -> 404 (never says why); allowed
+      + expired -> 410.
+    * The author is always the signed-in user, never something in the body.
     * Audience = the author + people who follow the author. Never in feeds,
       search, suggestions or the web.
     * Blocked either way, or hidden by the viewer -> the note doesn't exist for
@@ -21,6 +29,15 @@ Rules enforced here (not only in the app):
     * Pieces are a clothes-only snapshot built HERE from the caller's own
       wardrobe items (clean cut-outs only). The app never sends image URLs;
       try-on renders and the avatar are never used.
+      Sources: plan = my planner entry for today (my tz or UTC) · saved = my
+      outfit · own_post = my outfit that is published and not under review ·
+      dressing = 1-2 of my wardrobe items, not archived. Not mine -> 403.
+      Pieces deleted from the wardrobe since are dropped (never replaced);
+      none left -> 400 OUTFIT_EMPTY. A piece deleted AFTER posting stays in the
+      note as {deleted: true, image_url: null}.
+    * Text: <= 60 user-perceived characters (Unicode grapheme clusters, via the
+      `regex` package's grapheme matcher) after trimming.
+    * Reactions list: newest first, ties by user_id (desc); the cursor is that pair.
     * No view tracking. No push for a new note. Reaction pushes follow
       notification-settings like post reactions (activity type note_reacted).
     * Reactions refused on expired (410) / missing (404) notes and on your own.
@@ -94,17 +111,17 @@ def _iso(dt: datetime) -> str:
     return dt.astimezone(timezone.utc).isoformat()
 
 
-def _parse(ts) -> datetime:
-    return datetime.fromisoformat(str(ts).replace("Z", "+00:00"))
-
-
-def is_live(row: dict | None) -> bool:
-    return bool(row) and not row.get("deleted_at") and _parse(row["expires_at"]) > _now()
+try:
+    import regex as _regex                     # proper Unicode grapheme clusters (\X)
+except Exception:                              # pragma: no cover - fallback only
+    _regex = None
 
 
 def grapheme_len(text: str) -> int:
-    """User-perceived characters (an emoji, flag or skin-tone emoji = 1).
-    Approximation of Unicode grapheme clusters without extra packages."""
+    """User-perceived characters (an emoji, flag or skin-tone emoji = 1)."""
+    if _regex is not None:
+        return len(_regex.findall(r"\X", text))
+    # Fallback approximation if `regex` isn't installed.
     count, join_next, ri_open = 0, False, False
     for ch in text:
         cp = ord(ch)
@@ -207,12 +224,12 @@ def _from_source(user_id: str, source_type, source_id, item_ids) -> tuple[list[d
                 category = o[0].get("category")
         return _snapshot(user_id, plan.get("item_ids") or [], strict=False), category
 
-    rows = supabase.table("outfits").select("outfit_id, user_id, item_ids, category, is_public")\
+    rows = supabase.table("outfits").select("outfit_id, user_id, item_ids, category, is_public, under_review")\
         .eq("outfit_id", sid).limit(1).execute().data
     outfit = rows[0] if rows else None
     if not outfit or str(outfit["user_id"]) != user_id:
         raise _not_allowed("That outfit isn't yours.")
-    if st == "own_post" and not outfit.get("is_public"):
+    if st == "own_post" and (not outfit.get("is_public") or outfit.get("under_review")):
         raise _not_allowed("That post isn't published.")
     return _snapshot(user_id, outfit.get("item_ids") or [], strict=False), outfit.get("category")
 
@@ -265,20 +282,29 @@ def _get_row(note_id) -> dict | None:
     return rows[0] if rows else None
 
 
+def live_note_ids(note_ids) -> set[str]:
+    """Which of these notes are live right now, by DATABASE time."""
+    ids = list({str(i) for i in note_ids if i})
+    if not ids:
+        return set()
+    rows = supabase.table("live_fit_notes").select("id").in_("id", ids).execute().data or []
+    return {str(r["id"]) for r in rows}
+
+
 def _visible_row(note_id, viewer: str, allow_expired: bool = False) -> dict:
-    """404 if missing / deleted / replaced / not allowed (never says which).
-    410 if expired (only told to people who could have seen it)."""
+    """Authorisation first: 404 if missing / deleted / replaced / not allowed
+    (never says which). Then expiry: 410 only for people who could see it."""
     row = _get_row(note_id)
     if not row or row.get("deleted_at") or not _can_see(str(row["user_id"]), viewer):
         raise _not_found()
-    if not allow_expired and not is_live(row):
+    if not allow_expired and str(row["id"]) not in live_note_ids([row["id"]]):
         raise _expired()
     return row
 
 
 def _live_query():
-    return supabase.table("fit_notes").select(NOTE_FIELDS)\
-        .is_("deleted_at", "null").gt("expires_at", _iso(_now()))
+    """Live notes by DATABASE time (view: deleted_at is null and expires_at > now())."""
+    return supabase.table("live_fit_notes").select(NOTE_FIELDS)
 
 
 # ---------------------------------------------------------------- shaping
@@ -447,8 +473,17 @@ def delete_note(note_id, user_id) -> dict:
 
 # ---------------------------------------------------------------- reactions
 
+# react_fit_note raises these SQLSTATEs (see the NOTE-1 SQL).
+_REACT_ERRORS = {"FN404": _not_found, "FN410": _expired,
+                 "FN400": lambda: _bad("CANNOT_REACT_OWN", "You can't react to your own note.")}
+
+
 def react(note_id, user_id, reaction: str) -> dict:
-    from pipelines.activity_pipeline import record
+    """Authorisation in Python (follower, not blocked / hidden), then ONE database
+    transaction: re-check live by DB time, upsert the reaction, update the bell
+    row. Only a NEW reactor queues a push (changing your reaction never does);
+    the push queue allows one open push per bell row, so retries can't double-send."""
+    from pipelines.push_pipeline import enqueue as enqueue_push
     me = str(user_id)
     reaction = str(reaction or "").lower()
     if reaction not in REACTIONS:
@@ -457,10 +492,18 @@ def react(note_id, user_id, reaction: str) -> dict:
     owner, nid = str(row["user_id"]), str(row["id"])
     if owner == me:
         raise _bad("CANNOT_REACT_OWN", "You can't react to your own note.")
-    supabase.table("fit_note_reactions").upsert({
-        "note_id": nid, "user_id": me, "reaction": reaction, "created_at": _iso(_now()),
-    }, on_conflict="note_id,user_id").execute()
-    record(owner, me, "note_reacted", note_id=nid, reaction_type=reaction)   # + push
+    try:
+        res = supabase.rpc("react_fit_note", {
+            "p_note": nid, "p_user": me, "p_reaction": reaction,
+        }).execute()
+    except APIError as exc:
+        make = _REACT_ERRORS.get(getattr(exc, "code", None))
+        if make:
+            raise make()
+        raise
+    out = (res.data[0] if isinstance(res.data, list) and res.data else res.data) or {}
+    if out.get("out_notify") and out.get("out_activity_id"):
+        enqueue_push(owner, out["out_activity_id"], "note_reacted")
     return {"my_reaction": reaction}
 
 
@@ -494,7 +537,7 @@ def list_reactions(note_id, user_id, type_: str | None = None,
     row = _get_row(note_id)
     if not row or row.get("deleted_at") or str(row["user_id"]) != me:
         raise _not_found()
-    if not is_live(row):
+    if str(row["id"]) not in live_note_ids([row["id"]]):
         raise _expired()
     if type_ is not None and type_ not in REACTIONS:
         raise _bad("INVALID_REACTION", f"Reaction must be one of: {', '.join(REACTIONS)}.")

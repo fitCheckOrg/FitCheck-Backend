@@ -28,6 +28,8 @@ Approved rules (Keji, 2026-11-06):
     * No images, no avatar, no person photo; text is only names + the event.
       People the receiver blocked / hid (or who blocked them) never appear.
     * Tokens FCM reports as unregistered / invalid are deleted.
+    * NOTE-1: note_reacted is a reaction (digest + quiet hours); never pushed once
+      the note is expired or deleted. A new note is never pushed.
 """
 
 import asyncio
@@ -50,13 +52,14 @@ except Exception:
 
 PLATFORMS = ("android", "ios")
 REACTION_MODES = ("instant", "digest")
-DIGEST_TYPES = {"reacted", "liked_comment"}
+DIGEST_TYPES = {"reacted", "liked_comment", "note_reacted"}
 DIGEST_WINDOW = timedelta(hours=1)
 SETTING_FOR_TYPE = {
     "followed": "follows",
     "commented": "comments", "replied": "comments",
     "mentioned": "mentions",
     "reacted": "reactions", "liked_comment": "reactions", "milestone": "reactions",
+    "note_reacted": "reactions",                      # NOTE-1
 }
 DEFAULT_SETTINGS = {
     "follows": True, "comments": True, "mentions": True, "reactions": True,
@@ -307,8 +310,10 @@ def _deliverable(rows: list[dict], viewer: str) -> list[dict]:
     only for rows the receiver could see in the bell right now."""
     from pipelines.safety_pipeline import excluded_user_ids
     from pipelines.users_pipeline import build_users
+    from pipelines.notes_pipeline import live_note_ids
 
     excluded = excluded_user_ids(viewer)
+    live_notes = live_note_ids([r.get("note_id") for r in rows if r.get("note_id")])
     post_ids = list({str(r["post_id"]) for r in rows if r.get("post_id")})
     comment_ids = list({str(r["comment_id"]) for r in rows if r.get("comment_id")})
     posts, comments = {}, {}
@@ -338,12 +343,15 @@ def _deliverable(rows: list[dict], viewer: str) -> list[dict]:
             c = comments.get(str(r["comment_id"]))
             if not c or c.get("deleted"):
                 continue
+        if r["type"] == "note_reacted" and str(r.get("note_id")) not in live_notes:
+            continue                                   # note expired / deleted
         hidden = len([a for a in (r.get("actor_ids") or []) if str(a) in excluded])
         out.append({
             "activity": r, "type": r["type"],
             "names": [_name(people.get(actors[0]))] if actors else [],
             "count": max(len(actors), int(r.get("actor_count") or 0) - hidden),
             "post_id": str(r["post_id"]) if r.get("post_id") else None,
+            "note_id": str(r["note_id"]) if r.get("note_id") else None,
             "actor_id": actors[0] if actors else None,
         })
     return out
@@ -364,6 +372,8 @@ def _text(item: dict) -> tuple[str, str]:
         return "You were mentioned", f"{who} mentioned you in {where}"
     if t == "liked_comment":
         return "Comment liked", f"{who} liked your comment"
+    if t == "note_reacted":
+        return "New reactions", f"{who} reacted to your note"
     if t == "milestone":
         value = (item["activity"].get("milestone") or {}).get("value")
         return "Milestone", f"Your look reached {value} reactions" if value else "Your look hit a milestone"
@@ -372,7 +382,7 @@ def _text(item: dict) -> tuple[str, str]:
 
 def _summary(items: list[dict]) -> tuple[str, str]:
     followers = sum(i["count"] for i in items if i["type"] == "followed")
-    reactions = sum(i["count"] for i in items if i["type"] in ("reacted", "liked_comment"))
+    reactions = sum(i["count"] for i in items if i["type"] in ("reacted", "liked_comment", "note_reacted"))
     comments = len([i for i in items if i["type"] in ("commented", "replied")])
     mentions = len([i for i in items if i["type"] == "mentioned"])
     parts = []
@@ -477,7 +487,7 @@ def process_due() -> int:
                 item = items[0]
                 title, body = _text(item)
                 data = {"type": item["type"], "activity_id": item["activity"]["activity_id"],
-                        "post_id": item["post_id"],
+                        "post_id": item["post_id"], "note_id": item["note_id"],
                         "user_id": item["actor_id"] if item["type"] == "followed" else None}
                 collapse = str(item["activity"]["activity_id"])
             else:

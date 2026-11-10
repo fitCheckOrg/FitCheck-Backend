@@ -295,7 +295,18 @@ def public_profile(target_id, viewer_id) -> dict:
         "joined_at": row.get("created_at"),
         # PROFILE-SHARE-1: public page link; null until the user has a handle.
         "share_url": profile_url(user["handle"]) if user.get("handle") else None,
+        "active_note": _active_note(uid, viewer),
     }
+
+
+def _active_note(owner: str, viewer: str):
+    """NOTE-1: never breaks the profile if notes fail."""
+    try:
+        from pipelines.notes_pipeline import active_note_for_profile
+        return active_note_for_profile(owner, viewer)
+    except Exception:
+        logger.exception("active_note failed owner=%s", owner)
+        return None
 
 
 def public_profile_by_handle(raw, viewer_id) -> dict:

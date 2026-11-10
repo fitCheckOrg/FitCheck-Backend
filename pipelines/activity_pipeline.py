@@ -14,6 +14,9 @@ Types and who gets them:
     followed       the person followed
     liked_comment  comment author, when someone likes their comment
     milestone      post owner, when a post reaches MILESTONES reactions
+    note_reacted   note author, when someone reacts to their Fit Note (NOTE-1).
+                   Written by the database function react_fit_note together with
+                   the reaction (one transaction); one row per note per UTC day.
 
 Grouping: one row per (type, target, UTC day) - target = the post (the comment
 for liked_comment, nothing for followed). Exception - mentioned: one row per
@@ -41,7 +44,8 @@ from pipelines.push_pipeline import enqueue as enqueue_push
 
 logger = logging.getLogger(__name__)
 
-TYPES = ("reacted", "commented", "replied", "mentioned", "followed", "liked_comment", "milestone")
+TYPES = ("reacted", "commented", "replied", "mentioned", "followed", "liked_comment", "milestone",
+         "note_reacted")
 MAX_ACTORS_KEPT = 20
 SHOWN_ACTORS = 2
 MILESTONES = (10, 50, 100, 500, 1000)
@@ -59,7 +63,7 @@ def _now() -> str:
 
 def _upsert(recipient: str, actor: str | None, type_: str, group_key: str, *,
             post_id=None, comment_id=None, reaction_type=None, milestone=None,
-            once: bool = False, _retry: bool = True) -> str | None:
+            note_id=None, once: bool = False, _retry: bool = True) -> str | None:
     """Returns the activity_id when there's something NEW to push about
     (new row, or a new actor on an existing row), else None."""
     res = supabase.table("activity").select("activity_id, actor_ids, actor_count")\
@@ -91,17 +95,19 @@ def _upsert(recipient: str, actor: str | None, type_: str, group_key: str, *,
             "actor_ids": [actor] if actor else [],
             "actor_count": 1 if actor else 0,
             "reaction_type": reaction_type, "milestone": milestone,
+            "note_id": str(note_id) if note_id else None,
         }).execute()
         return str(ins.data[0]["activity_id"]) if ins.data else None
     except APIError as exc:
         if getattr(exc, "code", None) == "23505" and _retry:     # created at the same moment
             return _upsert(recipient, actor, type_, group_key, post_id=post_id, comment_id=comment_id,
-                           reaction_type=reaction_type, milestone=milestone, once=once, _retry=False)
+                           reaction_type=reaction_type, milestone=milestone, note_id=note_id,
+                           once=once, _retry=False)
         raise
 
 
 def record(recipient, actor, type_: str, *, post_id=None, comment_id=None,
-           reaction_type=None) -> None:
+           reaction_type=None, note_id=None) -> None:
     """Best effort: never raises."""
     try:
         recipient, actor = str(recipient or ""), str(actor or "")
@@ -182,6 +188,9 @@ def list_activity(user_id, cursor: str | None = None, limit: int = DEFAULT_PAGE)
         if has_more and rows else None
 
     excluded = excluded_user_ids(me)
+    from pipelines.notes_pipeline import notes_by_id, note_thumb, live_note_ids   # NOTE-1
+    notes = notes_by_id([r.get("note_id") for r in rows if r.get("note_id")])
+    live_notes = live_note_ids(list(notes))                 # by DATABASE time
     post_ids = list({str(r["post_id"]) for r in rows if r.get("post_id")})
     comment_ids = list({str(r["comment_id"]) for r in rows if r.get("comment_id")})
 
@@ -217,6 +226,13 @@ def list_activity(user_id, cursor: str | None = None, limit: int = DEFAULT_PAGE)
             post = {"post_id": str(p["outfit_id"]),
                     "items": [pieces.get(i, {"item_id": i, "deleted": True})
                               for i in (p.get("item_ids") or [])[:PREVIEW_PIECES]]}
+        note_fields = {}
+        if r["type"] == "note_reacted":
+            n = notes.get(str(r.get("note_id")))
+            if not n or n.get("deleted_at"):
+                continue                               # note deleted / replaced
+            note_fields = {"note_id": str(n["id"]), "note_thumb": note_thumb(n),
+                           "note_expired": str(n["id"]) not in live_notes}
         comment = None
         text_preview = None
         if r.get("comment_id"):
@@ -245,6 +261,7 @@ def list_activity(user_id, cursor: str | None = None, limit: int = DEFAULT_PAGE)
             "milestone": r.get("milestone"),
             "created_at": r["updated_at"],
             "read": bool(r.get("read")),
+            **note_fields,                                 # NOTE-1: note_id, note_thumb, note_expired
         })
     return {"items": items, "next_cursor": next_cursor}
 
