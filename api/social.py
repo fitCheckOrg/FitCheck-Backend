@@ -4,10 +4,11 @@ from shared.logger import get_logger
 from shared.models.responses import SuccessResponse
 from shared.exceptions import FitCheckException
 from core.storage.supabase_client import supabase
+import os
 import re
 from pydantic import BaseModel
 from typing import Literal
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from shared.dependencies import get_current_user_id
 from shared.models.enums import DiscoverCategory
 from pipelines.users_pipeline import (
@@ -17,7 +18,7 @@ from pipelines.safety_pipeline import (
     excluded_user_ids, is_blocked_either_way, not_interested_post_ids, not_in,
     mark_not_interested, unmark_not_interested, report_post,
 )
-from pipelines.comments_pipeline import bulk_comment_summary
+from pipelines.comments_pipeline import bulk_comment_summary, mentions_for, require_handle
 from pipelines.activity_pipeline import record, record_reaction
 from pipelines.insights_pipeline import bulk_share_counts
 from pipelines.share_page_pipeline import share_url
@@ -64,7 +65,7 @@ class EditPostRequest(BaseModel):
 
 @router.get("/health")
 async def health():
-    return { "service": "social", "version": "1.16.0", "status": "healthy" }
+    return { "service": "social", "version": "1.19.0", "status": "healthy" }
 
 
 @router.post("/follow/{target_user_id}", response_model=SuccessResponse)
@@ -356,7 +357,7 @@ def _get_reaction_counts(outfit_id: str) -> dict:
 FEED_FIELDS = (
     "outfit_id, user_id, overall_score, overall_grade, "
     "item_ids, occasion, name, created_at, published_at, is_public, category, "
-    "caption, ai_highlights, show_score, under_review, comments_enabled"
+    "caption, caption_mentions, ai_highlights, show_score, under_review, comments_enabled"
 )
 
 
@@ -372,7 +373,10 @@ async def get_discover_feed(
     Browse public outfits from the community.
     sort=recent    -> newest posts first (by published_at)
     sort=popular   -> most reactions ever first (across ALL posts, not per page)
-    sort=trending  -> most reactions in the last 7 days first, then newest
+    sort=trending  -> most reactions in the last 7 days first, then newest.
+                      TRENDING-CITY-1: + region_label (viewer's city when it has
+                      >= TRENDING_REGION_MIN_POSTS posts this week - then only
+                      that city's posts) and updated_at
     sort=following -> public outfits only from users you follow, newest first
     """
     logger.info(f"Get feed - user={user_id} sort={sort} category={category}")
@@ -433,6 +437,34 @@ async def get_discover_feed(
             "has_more": (offset + limit) < total
         }
     })
+# TRENDING-CITY-1: "Trending in <city>" when the viewer's city has enough posts
+# this week; otherwise the global list. Env TRENDING_REGION_MIN_POSTS overrides.
+TRENDING_REGION_MIN_POSTS = int(os.getenv("TRENDING_REGION_MIN_POSTS") or 12)
+TRENDING_WINDOW_DAYS = 7
+REGION_USERS_CAP = 200          # ids go in the URL; move to a SQL view when cities get big
+
+
+def _trending_region(viewer_id: str, excluded: set[str]) -> tuple[str | None, list[str]]:
+    """(city label, ids of users in that city) or (None, []) for the global list.
+    City = the viewer's profile city (B10), matched case-insensitively."""
+    row = supabase.table("profiles").select("city").eq("id", viewer_id).limit(1).execute().data
+    city = " ".join(str((row[0].get("city") if row else "") or "").split())
+    if not city:
+        return None, []
+    people = supabase.table("profiles").select("id").ilike("city", city)\
+        .limit(REGION_USERS_CAP).execute().data or []
+    ids = [str(r["id"]) for r in people if str(r["id"]) not in excluded]
+    if not ids:
+        return None, []
+    since = (datetime.now(timezone.utc) - timedelta(days=TRENDING_WINDOW_DAYS)).isoformat()
+    recent = supabase.table("outfits").select("outfit_id", count="exact")\
+        .in_("user_id", ids).eq("is_public", True).eq("under_review", False)\
+        .gte("published_at", since).limit(1).execute().count or 0
+    if recent < TRENDING_REGION_MIN_POSTS:
+        return None, []
+    return city, ids
+
+
 def _ranked_feed(sort: str, category, limit: int, offset: int, user_id: str,
                  excluded: set[str] = frozenset(), skipped_posts: set[str] = frozenset()
                  ) -> SuccessResponse:
@@ -442,9 +474,14 @@ def _ranked_feed(sort: str, category, limit: int, offset: int, user_id: str,
     Ties: newest post first.
     """
     metric = "total_reactions" if sort == "popular" else "reactions_7d"
+    region, region_ids = (None, [])
+    if sort == "trending":
+        region, region_ids = _trending_region(user_id, set(excluded))
 
     rq = supabase.table("public_post_rank")\
         .select("outfit_id", count="exact")
+    if region_ids:
+        rq = rq.in_("user_id", region_ids)                # TRENDING-CITY-1
     if category:
         rq = rq.eq("category", category.value)
     rq = not_in(rq, "user_id", excluded)
@@ -475,9 +512,10 @@ def _ranked_feed(sort: str, category, limit: int, offset: int, user_id: str,
         }
     }
     if sort == "trending":
-        # No location data yet (profiles have no city) -> Flutter shows
-        # "Trending this week".
-        data["region_label"] = None
+        # TRENDING-CITY-1: the city name when the list is that city's, else null
+        # ("Trending this week"). Ranked live, so updated_at = now.
+        data["region_label"] = region
+        data["updated_at"] = datetime.now(timezone.utc).isoformat()
     return SuccessResponse(data=data)
 
 
@@ -548,6 +586,12 @@ def _decorate_posts(outfits: list[dict], user_id: str) -> None:
         outfit["comments_enabled"] = outfit.get("comments_enabled") is not False
         outfit["share_count"] = share_counts.get(str(oid), 0)
         outfit["share_url"] = share_url(oid)                      # E20
+        # MENTION-CAPTION-1: tappable @handles in the caption (UTF-16 offsets).
+        # People the viewer blocked / hid (or who blocked them) aren't linked.
+        outfit["caption_mentions"] = [
+            m for m in (outfit.get("caption_mentions") or [])
+            if outfit.get("caption") and str(m.get("user_id")) not in excluded
+        ]
 
         _apply_score_visibility(outfit)
 
@@ -679,6 +723,22 @@ def _clean_caption(caption) -> str | None:
     return text or None
 
 
+def _caption_mentions(caption: str | None, author: str) -> list[dict]:
+    """MENTION-CAPTION-1: same rules as comments (C13) - unknown handles and
+    people blocked either way / hidden by you stay plain text. You are never
+    notified about mentioning yourself (activity skips it)."""
+    return mentions_for(caption, author)
+
+
+def _notify_caption_mentions(post_id: str, author: str, mentions: list) -> None:
+    """Tell everyone mentioned. Activity keeps one row per (caption, person) and
+    never repeats it, so calling this on every save notifies each person once -
+    and a save that failed half-way still notifies on the next save.
+    Removing a mention doesn't un-notify."""
+    for uid in {str(m["user_id"]) for m in mentions}:
+        record(uid, author, "mentioned", post_id=post_id)
+
+
 def _own_outfit(outfit_id: str, user_id: str) -> dict:
     res = supabase.table("outfits")\
         .select("outfit_id, is_public, published_at")\
@@ -708,12 +768,17 @@ async def publish_post(
     """
     A5: publish one of your saved outfits to Discover (or re-publish it with
     new settings). post_id = the outfit's outfit_id. Returns the post (feed shape).
+    HANDLE-REQ-1: 403 HANDLE_REQUIRED if you have no @handle yet.
     """
     uid, pid = str(user_id), str(post_id)
+    require_handle(uid)                                 # HANDLE-REQ-1: 403 HANDLE_REQUIRED
     current = _own_outfit(pid, uid)
+    caption = _clean_caption(body.caption)
+    mentions = _caption_mentions(caption, uid)
     updates = {
         "is_public": True,
-        "caption": _clean_caption(body.caption),
+        "caption": caption,
+        "caption_mentions": mentions,
         "category": body.category.value if body.category else None,
         "show_score": body.show_score,
         "comments_enabled": body.comments_enabled,
@@ -723,6 +788,7 @@ async def publish_post(
 
     supabase.table("outfits").update(updates)\
         .eq("outfit_id", pid).eq("user_id", uid).execute()
+    _notify_caption_mentions(pid, uid, mentions)
     logger.info(f"Publish post - outfit={pid} user={uid}")
     return _post_response(pid, uid)
 
@@ -746,8 +812,11 @@ async def edit_post(
 
     sent = body.model_fields_set
     updates = {}
+    new_mentions = None
     if "caption" in sent:
         updates["caption"] = _clean_caption(body.caption)
+        new_mentions = _caption_mentions(updates["caption"], uid)
+        updates["caption_mentions"] = new_mentions
     if "category" in sent:
         updates["category"] = body.category.value if body.category else None
     if "show_score" in sent and body.show_score is not None:
@@ -758,6 +827,8 @@ async def edit_post(
     if updates:
         supabase.table("outfits").update(updates)\
             .eq("outfit_id", pid).eq("user_id", uid).execute()
+    if new_mentions is not None:
+        _notify_caption_mentions(pid, uid, new_mentions)
     return _post_response(pid, uid)
 
 
@@ -775,7 +846,7 @@ async def delete_post(
     _own_outfit(pid, uid)
 
     supabase.table("outfits").update({
-        "is_public": False, "caption": None, "published_at": None,
+        "is_public": False, "caption": None, "caption_mentions": [], "published_at": None,
     }).eq("outfit_id", pid).eq("user_id", uid).execute()
 
     reactions = supabase.table("outfit_reactions").delete()\

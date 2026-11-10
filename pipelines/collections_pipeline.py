@@ -1,12 +1,13 @@
 """
-Collections (COL-1) - named, private folders of saved looks, saved outfits
-and (A7, 2026-10-31) saved Discover posts.
+Collections (COL-1) - named folders of saved looks, saved outfits
+and (A7, 2026-10-31) saved Discover posts. Private by default; COLLECTIONS-PUBLIC-1
+(2026-11-06) lets the owner make one public.
 
 Optional on top of saving: a look/outfit is saved first, then (optionally)
 filed into one or more collections.
 
 Tables (see sql/collections.sql):
-    collections         (collection_id, user_id, name, created_at, updated_at)
+    collections         (collection_id, user_id, name, is_public, created_at, updated_at)
                         unique (user_id, lower(btrim(name)))
     collection_entries  (entry_id, collection_id, user_id, look_id | outfit_id | post_id, added_at)
                         exactly one of the three. look_id / outfit_id: FK ON DELETE CASCADE.
@@ -21,8 +22,18 @@ Rules:
     * adding a post to a collection also bookmarks it (saved_outfits)
     * name 1-40 chars after trimming, unique per user (case-insensitive)
     * every query is scoped to the user - another user's ids give 404
+      (except the public views below)
+
+COLLECTIONS-PUBLIC-1 - public view (anyone but the owner):
+    * only collections with is_public = true; private ones 404 COLLECTION_NOT_FOUND
+    * only POST entries are ever shown. Looks (try-on photos of the owner) and
+      private outfits are NEVER shown to anyone else, even in a public collection.
+    * posts that are unpublished, under review, or by people blocked either way /
+      hidden for the viewer are skipped and not counted in post_count
+    * owner and viewer blocked either way -> 404 (USER_NOT_FOUND / COLLECTION_NOT_FOUND)
 """
 
+import base64
 import logging
 from datetime import datetime, timezone
 from uuid import UUID
@@ -32,6 +43,7 @@ from postgrest.exceptions import APIError
 from core.storage.supabase_client import supabase
 from shared.exceptions import FitCheckException
 from pipelines.tryon_looks_pipeline import _to_look
+from pipelines.safety_pipeline import excluded_user_ids, is_blocked_either_way
 
 logger = logging.getLogger(__name__)
 
@@ -40,6 +52,9 @@ ENTRIES = "collection_entries"
 MAX_NAME_LEN = 40
 MAX_COLLECTIONS = 100
 MAX_PAGE = 100
+COVER_POSTS = 4
+COVER_PIECES = 4
+PUBLIC_PAGE = 20
 ENTRY_TYPES = {"look": "look_id", "outfit": "outfit_id", "post": "post_id"}
 
 
@@ -147,6 +162,7 @@ def _summaries(uid: str, rows: list[dict]) -> list[dict]:
             "name": r["name"],
             "item_count": counts.get(cid, 0),
             "cover_image_url": cover_by_look.get(newest_look.get(cid)),
+            "is_public": bool(r.get("is_public")),          # COLLECTIONS-PUBLIC-1
             "created_at": r["created_at"],
             "updated_at": r["updated_at"],
         })
@@ -262,6 +278,20 @@ def rename_collection(user_id: UUID, collection_id: UUID, name) -> dict:
     if not res.data:
         raise _collection_not_found()
     return _summaries(uid, res.data)[0]
+
+
+def update_collection(user_id: UUID, collection_id: UUID, sent: dict) -> dict:
+    """PATCH: only the fields sent change. name -> rename (same rules as before);
+    is_public (COLLECTIONS-PUBLIC-1) -> show / hide it on your profile."""
+    uid, cid = str(user_id), str(collection_id)
+    _get_collection_row(uid, cid)
+    if sent.get("name") is not None:
+        rename_collection(user_id, collection_id, sent["name"])
+    if "is_public" in sent and sent["is_public"] is not None:
+        supabase.table(COLLECTIONS).update({"is_public": bool(sent["is_public"])})\
+            .eq("collection_id", cid).eq("user_id", uid).execute()
+        logger.info("collection visibility user=%s collection=%s public=%s", uid, cid, sent["is_public"])
+    return _summaries(uid, [_get_collection_row(uid, cid)])[0]
 
 
 def delete_collection(user_id: UUID, collection_id: UUID) -> dict:
@@ -395,3 +425,140 @@ def remove_entry(user_id: UUID, collection_id: UUID, entry_type: str,
     _touch(cid)
     return {"collection_id": cid, "entry_type": entry_type.lower(),
             "entry_id": eid, "deleted": True}
+
+
+# ---------------------------------------------------------------- COLLECTIONS-PUBLIC-1
+
+def _visible_posts(post_ids: list[str], viewer: str) -> dict[str, dict]:
+    """post_id -> {outfit_id, user_id, item_ids} for posts this viewer may see:
+    public, not under review (unless theirs), creator not blocked / hidden."""
+    if not post_ids:
+        return {}
+    excluded = excluded_user_ids(viewer)
+    rows = supabase.table("outfits").select("outfit_id, user_id, item_ids, is_public, under_review")\
+        .in_("outfit_id", list(set(post_ids))).execute().data or []
+    out = {}
+    for r in rows:
+        creator = str(r["user_id"])
+        if not r.get("is_public") or creator in excluded:
+            continue
+        if r.get("under_review") and creator != viewer:
+            continue
+        out[str(r["outfit_id"])] = r
+    return out
+
+
+def user_collections(owner_id, viewer_id) -> dict:
+    """GET /api/users/{user_id}/collections. Others see only public collections;
+    the owner sees all of theirs (with is_public). Each collection:
+    {collection_id, name, is_public, post_count, cover_posts[<=4 {post_id, items[]}],
+     updated_at} (+ item_count for the owner: every entry, looks/outfits included)."""
+    from api.social import _get_bulk_item_details        # avoid a circular import
+
+    owner, viewer = str(owner_id), str(viewer_id)
+    mine = owner == viewer
+    prof = supabase.table("profiles").select("id").eq("id", owner).limit(1).execute().data
+    if not prof or (not mine and is_blocked_either_way(owner, viewer)):
+        raise _not_found("USER_NOT_FOUND", "User not found.")
+
+    q = supabase.table(COLLECTIONS).select("*").eq("user_id", owner)
+    if not mine:
+        q = q.eq("is_public", True)
+    rows = q.order("updated_at", desc=True).limit(MAX_PAGE).execute().data or []
+    if not rows:
+        return {"items": [], "next_cursor": None}
+
+    ids = [r["collection_id"] for r in rows]
+    entries = supabase.table(ENTRIES).select("collection_id, post_id, added_at")\
+        .in_("collection_id", ids).order("added_at", desc=True).execute().data or []
+    visible = _visible_posts([e["post_id"] for e in entries if e.get("post_id")], viewer)
+    summaries = {c["collection_id"]: c for c in _summaries(owner, rows)} if mine else {}
+
+    per = {cid: [] for cid in ids}
+    for e in entries:
+        pid = str(e["post_id"]) if e.get("post_id") else None
+        if pid and pid in visible:
+            per[e["collection_id"]].append(pid)
+
+    cover_ids = {p for cid in ids for p in per[cid][:COVER_POSTS]}
+    piece_ids = list({str(i) for p in cover_ids for i in (visible[p].get("item_ids") or [])[:COVER_PIECES]})
+    pieces = _get_bulk_item_details(piece_ids)
+
+    items = []
+    for r in rows:
+        cid = r["collection_id"]
+        item = {
+            "collection_id": cid,
+            "name": r["name"],
+            "is_public": bool(r.get("is_public")),
+            "post_count": len(per[cid]),
+            "cover_posts": [{
+                "post_id": p,
+                "items": [pieces.get(str(i), {"item_id": str(i), "deleted": True})
+                          for i in (visible[p].get("item_ids") or [])[:COVER_PIECES]],
+            } for p in per[cid][:COVER_POSTS]],
+            "updated_at": r["updated_at"],
+        }
+        if mine:
+            item["item_count"] = summaries.get(cid, {}).get("item_count", len(per[cid]))
+        items.append(item)
+    return {"items": items, "next_cursor": None}
+
+
+def _encode(added_at: str, post_id: str) -> str:
+    return base64.urlsafe_b64encode(f"{added_at}|{post_id}".encode()).decode()
+
+
+def _decode(cursor: str) -> tuple[str, str]:
+    try:
+        ts, pid = base64.urlsafe_b64decode(cursor.encode()).decode().split("|", 1)
+        UUID(pid)
+        return ts, pid
+    except Exception:
+        raise FitCheckException("That page cursor isn't valid. Start from the first page.",
+                                code="INVALID_CURSOR", status_code=400)
+
+
+def collection_posts(collection_id, viewer_id, cursor: str | None = None,
+                     limit: int = PUBLIC_PAGE) -> dict:
+    """GET /api/collections/{id}/posts - the collection's POSTS in the feed shape,
+    newest added first. Anyone if public, else only the owner (404 otherwise)."""
+    from api.social import FEED_FIELDS, _decorate_posts   # avoid a circular import
+
+    cid, viewer = str(collection_id), str(viewer_id)
+    limit = max(1, min(int(limit), 50))
+    res = supabase.table(COLLECTIONS).select("collection_id, user_id, name, is_public")\
+        .eq("collection_id", cid).limit(1).execute().data
+    col = res[0] if res else None
+    if not col:
+        raise _collection_not_found()
+    owner = str(col["user_id"])
+    if owner != viewer and (not col.get("is_public") or is_blocked_either_way(owner, viewer)):
+        raise _collection_not_found()
+
+    q = supabase.table(ENTRIES).select("post_id, added_at")\
+        .eq("collection_id", cid).filter("post_id", "not.is", "null")
+    if cursor:
+        ts, pid = _decode(cursor)
+        q = q.or_(f'added_at.lt."{ts}",and(added_at.eq."{ts}",post_id.lt.{pid})')
+    rows = q.order("added_at", desc=True).order("post_id", desc=True)\
+        .limit(limit + 1).execute().data or []
+    has_more = len(rows) > limit
+    rows = rows[:limit]
+
+    visible = _visible_posts([r["post_id"] for r in rows], viewer)
+    posts = []
+    if visible:
+        full = supabase.table("outfits").select(FEED_FIELDS)\
+            .in_("outfit_id", list(visible)).execute().data or []
+        by_id = {str(p["outfit_id"]): p for p in full}
+        posts = [by_id[str(r["post_id"])] for r in rows if str(r["post_id"]) in by_id]
+        _decorate_posts(posts, viewer)
+
+    last = rows[-1] if rows else None
+    return {
+        "collection": {"collection_id": cid, "name": col["name"],
+                       "is_public": bool(col.get("is_public")), "owner_id": owner},
+        "items": posts,
+        "next_cursor": _encode(str(last["added_at"]), str(last["post_id"])) if has_more and last else None,
+    }

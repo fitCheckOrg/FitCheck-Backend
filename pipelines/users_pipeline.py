@@ -20,6 +20,7 @@ Handles (profiles.handle):
       fix a typo. The lock starts at the first CHANGE: after that, one change
       every HANDLE_CHANGE_DAYS days.
 
+PROFILE-SHARE-1: public_profile includes share_url (.../u/{handle}, null with no handle).
 Public profile (B10): profiles.bio (<=150), city (<=40), style_tags (<=5 from
 STYLE_TAGS). Counts are live: public posts, followers, following, reactions
 received on public posts.
@@ -38,6 +39,7 @@ from core.storage.s3 import storage
 from core.storage.supabase_client import supabase
 from shared.exceptions import FitCheckException
 from pipelines.safety_pipeline import is_blocked_either_way, excluded_user_ids, not_in
+from pipelines.share_page_pipeline import profile_url
 
 logger = logging.getLogger(__name__)
 
@@ -291,6 +293,8 @@ def public_profile(target_id, viewer_id) -> dict:
         },
         "follows_me": _follows_me(uid, viewer),
         "joined_at": row.get("created_at"),
+        # PROFILE-SHARE-1: public page link; null until the user has a handle.
+        "share_url": profile_url(user["handle"]) if user.get("handle") else None,
     }
 
 

@@ -5,7 +5,8 @@ Public, read-only pages served by this API (no login):
     GET /p/{post_id}             HTML page: collage, caption, creator name + @handle,
                                  reaction total, "Open in FitCheck" + store buttons
     GET /p/{post_id}/og.png      1200x630 Open Graph image made from the collage only
-    GET /u/{handle}              small public profile page (name, @handle, bio, post count)
+    GET /u/{handle}              public profile page (PROFILE-SHARE-1): name, @handle, bio,
+                                 city, style tags, counts, grid of public looks as collages
     GET /.well-known/assetlinks.json            Android App Links (/p/*, /u/*)
     GET /.well-known/apple-app-site-association iOS Universal Links (/p/*, /u/*)
 
@@ -113,6 +114,13 @@ h1{font-family:Georgia,serif;font-size:22px;margin:16px 0 4px}
 .btn{display:block;text-align:center;text-decoration:none;border-radius:999px;padding:14px;margin-top:12px;font-weight:600}
 .primary{background:#1B1A17;color:#fff}.ghost{border:1px solid #1B1A17;color:#1B1A17}
 .stores{display:flex;gap:10px}.stores a{flex:1}
+.tags{margin-top:10px}.tag{display:inline-block;border:1px solid #D9D3C7;border-radius:999px;padding:4px 10px;margin:4px 6px 0 0;font-size:13px;color:#3A3832}
+.counts{display:flex;gap:18px;margin-top:14px;font-size:14px;color:#6E6A62}.counts b{display:block;color:#1B1A17;font-size:17px}
+.looks{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-top:16px}
+.look{display:grid;grid-template-columns:1fr 1fr;gap:4px;background:#fff;border-radius:16px;padding:8px;text-decoration:none;box-shadow:0 4px 16px rgba(0,0,0,.05)}
+.look img{width:100%;aspect-ratio:1/1;object-fit:contain;background:#F7F4EE;border-radius:10px}
+.look.one{grid-template-columns:1fr}
+.empty{color:#6E6A62;font-size:14px;margin-top:16px;text-align:center}
 """
 
 
@@ -138,10 +146,13 @@ def _store_buttons() -> str:
     return f'<div class="stores">{"".join(links)}</div>' if links else ""
 
 
-def not_found_page() -> str:
+def not_found_page(kind: str = "post") -> str:
+    if kind == "profile":
+        head, sub = "This profile isn't available", "Check the link, or find them in the FitCheck app."
+    else:
+        head, sub = "This look isn't available", "It may have been taken down or made private."
     return _page("Not available - FitCheck",
-                 '<div class="card"><h1>This look isn\'t available</h1>'
-                 '<div class="by">It may have been taken down or made private.</div></div>'
+                 f'<div class="card"><h1>{head}</h1><div class="by">{sub}</div></div>'
                  + _store_buttons())
 
 
@@ -177,27 +188,83 @@ def post_page(post_id: str) -> str | None:
     return _page(f"{title} - FitCheck", body, og)
 
 
+PROFILE_LOOKS = 12
+
+
+def _count(table: str, column: str, **filters) -> int:
+    q = supabase.table(table).select(column, count="exact")
+    for k, v in filters.items():
+        q = q.eq(k, v)
+    return q.limit(1).execute().count or 0
+
+
+def _look_tiles(user_id: str) -> tuple[list[dict], int]:
+    """The newest PROFILE_LOOKS public posts (not under review) + the total.
+    Each tile = {post_id, images[] up to MAX_PIECES clean cut-outs}."""
+    res = supabase.table("outfits").select("outfit_id, item_ids", count="exact")\
+        .eq("user_id", user_id).eq("is_public", True).eq("under_review", False)\
+        .order("published_at", desc=True, nullsfirst=False)\
+        .limit(PROFILE_LOOKS).execute()
+    posts = res.data or []
+    ids = list({str(i) for p in posts for i in (p.get("item_ids") or [])[:MAX_PIECES]})
+    by_id = {}
+    if ids:
+        for r in supabase.table("closet_items").select("item_id, clean_image_url")\
+                .in_("item_id", ids).execute().data or []:
+            by_id[str(r["item_id"])] = r.get("clean_image_url")
+    tiles = []
+    for p in posts:
+        imgs = [by_id[str(i)] for i in (p.get("item_ids") or [])[:MAX_PIECES] if by_id.get(str(i))]
+        if imgs:
+            tiles.append({"post_id": str(p["outfit_id"]), "images": imgs})
+    return tiles, res.count or 0
+
+
 def profile_page(handle: str) -> str | None:
+    """PROFILE-SHARE-1. Never an avatar / profile photo / person photo - only
+    clothes collages. Unknown handle -> None (the route shows a 404 page)."""
     h = str(handle or "").strip().lstrip("@").lower()
-    rows = supabase.table("profiles").select("id, full_name, handle, bio")\
+    rows = supabase.table("profiles").select("id, full_name, handle, bio, city, style_tags")\
         .eq("handle", h).limit(1).execute().data if h else None
     if not rows:
         return None
     p = rows[0]
-    posts = supabase.table("outfits").select("outfit_id", count="exact")\
-        .eq("user_id", p["id"]).eq("is_public", True).eq("under_review", False)\
-        .limit(1).execute().count or 0
+    uid = str(p["id"])
+    tiles, posts = _look_tiles(uid)
+    followers = _count("follows", "follower_id", following_id=uid)
+    following = _count("follows", "following_id", follower_id=uid)
     name = p.get("full_name") or f"@{p['handle']}"
+    tags = [str(t) for t in (p.get("style_tags") or []) if t]
+
+    def plural(n: int, word: str) -> str:
+        return f"{word}{'' if n == 1 else 's'}"
+
+    tag_html = ('<div class="tags">' + "".join(
+        f'<span class="tag">{html.escape(t.replace("_", " ").capitalize())}</span>' for t in tags)
+        + "</div>") if tags else ""
+    looks = "".join(
+        f'<a class="look{" one" if len(t["images"]) == 1 else ""}" href="{html.escape(share_url(t["post_id"]))}">'
+        + "".join(f'<img src="{html.escape(u)}" alt="">' for u in t["images"]) + "</a>"
+        for t in tiles)
+    looks_html = f'<div class="looks">{looks}</div>' if looks else '<div class="empty">No public looks yet.</div>'
+
     body = (f'<div class="card"><h1>{html.escape(name)}</h1>'
-            f'<div class="by">@{html.escape(p["handle"])}</div>'
+            f'<div class="by">@{html.escape(p["handle"])}'
+            + (f' &middot; {html.escape(p["city"])}' if p.get("city") else "") + '</div>'
             + (f'<div class="meta">{html.escape(p["bio"])}</div>' if p.get("bio") else "")
-            + f'<div class="meta">{posts} look{"" if posts == 1 else "s"} on FitCheck</div></div>'
-            f'<a class="btn primary" href="{html.escape(profile_url(p["handle"]))}">Open in FitCheck</a>'
+            + tag_html
+            + f'<div class="counts"><div><b>{posts}</b>{plural(posts, "look")}</div>'
+              f'<div><b>{followers}</b>{plural(followers, "follower")}</div>'
+              f'<div><b>{following}</b>following</div></div></div>'
+            + looks_html
+            + f'<a class="btn primary" href="{html.escape(profile_url(p["handle"]))}">Open in FitCheck</a>'
             + _store_buttons())
     og = {"og:type": "profile", "og:site_name": "FitCheck",
           "og:title": f"{name} (@{p['handle']}) on FitCheck",
-          "og:description": p.get("bio") or f"{posts} looks on FitCheck",
+          "og:description": p.get("bio") or f"{posts} {plural(posts, 'look')} on FitCheck",
           "og:url": profile_url(p["handle"])}
+    if tiles:                                    # a collage, never a person photo
+        og["og:image"] = f"{share_url(tiles[0]['post_id'])}/og.png"
     return _page(f"{name} - FitCheck", body, og)
 
 

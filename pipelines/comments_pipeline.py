@@ -21,6 +21,10 @@ Rules:
     * comments_enabled=false: list still works (read-only), new comments 403 COMMENTS_OFF.
     * no automatic text filter yet - reports (E18) cover abuse.
     * D15: new comments / replies / @mentions / new likes go to the bell.
+    * MENTION-CAPTION-1: people the author blocked / hid (or who blocked the
+      author) are not linked; editing to add a mention notifies the new person once.
+    * HANDLE-REQ-1: no handle -> 403 HANDLE_REQUIRED on new comments (and on
+      publishing a post, see api/social.py). Reactions, saves, follows still work.
 """
 
 import base64
@@ -381,10 +385,29 @@ def _check_rate(uid: str) -> None:
         raise _rate_limited(3600)
 
 
+def require_handle(user_id) -> None:
+    """HANDLE-REQ-1: posting text under your name needs an @handle."""
+    res = supabase.table("profiles").select("handle").eq("id", str(user_id)).limit(1).execute()
+    handle = (res.data[0].get("handle") if res.data else None) or ""
+    if not handle.strip():
+        raise _bad("HANDLE_REQUIRED", "Pick your @handle first.", 403)
+
+
+def mentions_for(text: str | None, author) -> list[dict]:
+    """@mentions the author may link: not people blocked either way or hidden by
+    the author. Shared by comments and post captions (MENTION-CAPTION-1)."""
+    found = _parse_mentions(text) if text else []
+    if not found:
+        return []
+    excluded = excluded_user_ids(str(author))
+    return [m for m in found if str(m["user_id"]) not in excluded]
+
+
 def create_comment(post_id, user_id, text, parent_id=None) -> dict:
     pid, me = str(post_id), str(user_id)
     clean = _clean_text(text)
     post = _visible_post(pid, me)
+    require_handle(me)                                  # HANDLE-REQ-1
     if post_comments_enabled(pid) is False:
         raise _bad("COMMENTS_OFF", "Comments are turned off for this post.", 403)
 
@@ -404,7 +427,7 @@ def create_comment(post_id, user_id, text, parent_id=None) -> dict:
         "parent_id": str(parent["comment_id"]) if parent else None,
         "user_id": me,
         "text": clean,
-        "mentions": _parse_mentions(clean),
+        "mentions": mentions_for(clean, me),
     }).execute().data[0]
     logger.info("comment created post=%s user=%s parent=%s", pid, me, parent and parent["comment_id"])
     comment = _build([row], me, {pid: str(post["user_id"])})[0]
@@ -427,9 +450,14 @@ def edit_comment(comment_id, user_id, sent: dict) -> dict:
             raise _bad("EDIT_WINDOW_CLOSED",
                        f"Comments can only be edited for {EDIT_WINDOW_MIN} minutes.", 403)
         clean = _clean_text(sent["text"])
+        mentions = mentions_for(clean, me)
         supabase.table("comments").update({
-            "text": clean, "mentions": _parse_mentions(clean), "edited_at": _now().isoformat(),
+            "text": clean, "mentions": mentions, "edited_at": _now().isoformat(),
         }).eq("comment_id", c["comment_id"]).execute()
+        # Everyone mentioned is told once - activity never repeats a (comment, person)
+        # row, so people already told on create aren't told again.
+        for uid in {str(m["user_id"]) for m in mentions}:
+            record(uid, me, "mentioned", post_id=c["post_id"], comment_id=c["comment_id"])
 
     if "pinned" in sent and sent["pinned"] is not None:
         if owner != me:

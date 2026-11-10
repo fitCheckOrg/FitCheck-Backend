@@ -10,18 +10,24 @@ Types and who gets them:
     reacted        post owner, when someone reacts to their post
     commented      post owner, when someone comments / replies on their post
     replied        comment author, when someone replies to their comment
-    mentioned      a user @mentioned in a comment
+    mentioned      a user @mentioned in a comment or (MENTION-CAPTION-1) a post caption
     followed       the person followed
     liked_comment  comment author, when someone likes their comment
     milestone      post owner, when a post reaches MILESTONES reactions
 
 Grouping: one row per (type, target, UTC day) - target = the post (the comment
-for liked_comment, nothing for followed). A new event updates the row: actor
+for liked_comment, nothing for followed). Exception - mentioned: one row per
+(person, comment) or (person, caption), no day, created once and never bumped,
+so editing a caption / comment can't notify the same person twice. A new event updates the row: actor
 moved to the front, count +1 if new, updated_at = now, read = false. Milestones
 are one row per (post, value), never repeated.
 
 Never: yourself, people blocked either way. Hidden/blocked actors are filtered
 on read. Recording never breaks the action that caused it (errors are logged).
+
+PUSH-1 (2026-11-06): when a row is created, or gets a NEW actor, it is handed to
+push_pipeline.enqueue (settings, reaction digest, quiet hours live there). The
+same person reacting again, or a mention row that already exists, pushes nothing.
 """
 
 import logging
@@ -31,6 +37,7 @@ from postgrest.exceptions import APIError
 
 from core.storage.supabase_client import supabase
 from pipelines.safety_pipeline import excluded_user_ids, is_blocked_either_way
+from pipelines.push_pipeline import enqueue as enqueue_push
 
 logger = logging.getLogger(__name__)
 
@@ -52,16 +59,22 @@ def _now() -> str:
 
 def _upsert(recipient: str, actor: str | None, type_: str, group_key: str, *,
             post_id=None, comment_id=None, reaction_type=None, milestone=None,
-            _retry: bool = True) -> None:
+            once: bool = False, _retry: bool = True) -> str | None:
+    """Returns the activity_id when there's something NEW to push about
+    (new row, or a new actor on an existing row), else None."""
     res = supabase.table("activity").select("activity_id, actor_ids, actor_count")\
         .eq("user_id", recipient).eq("group_key", group_key).limit(1).execute()
+    if res.data and once:
+        return None                                    # already notified
     if res.data:
         row = res.data[0]
         ids = [str(i) for i in (row.get("actor_ids") or [])]
         count = int(row.get("actor_count") or 0)
+        new_actor = False
         if actor:
             if actor not in ids:
                 count += 1
+                new_actor = True
             ids = ([actor] + [i for i in ids if i != actor])[:MAX_ACTORS_KEPT]
         update = {"actor_ids": ids, "actor_count": count, "updated_at": _now(), "read": False}
         if comment_id:
@@ -69,9 +82,9 @@ def _upsert(recipient: str, actor: str | None, type_: str, group_key: str, *,
         if reaction_type:
             update["reaction_type"] = reaction_type
         supabase.table("activity").update(update).eq("activity_id", row["activity_id"]).execute()
-        return
+        return str(row["activity_id"]) if new_actor else None
     try:
-        supabase.table("activity").insert({
+        ins = supabase.table("activity").insert({
             "user_id": recipient, "type": type_, "group_key": group_key,
             "post_id": str(post_id) if post_id else None,
             "comment_id": str(comment_id) if comment_id else None,
@@ -79,12 +92,12 @@ def _upsert(recipient: str, actor: str | None, type_: str, group_key: str, *,
             "actor_count": 1 if actor else 0,
             "reaction_type": reaction_type, "milestone": milestone,
         }).execute()
+        return str(ins.data[0]["activity_id"]) if ins.data else None
     except APIError as exc:
         if getattr(exc, "code", None) == "23505" and _retry:     # created at the same moment
-            _upsert(recipient, actor, type_, group_key, post_id=post_id, comment_id=comment_id,
-                    reaction_type=reaction_type, milestone=milestone, _retry=False)
-        else:
-            raise
+            return _upsert(recipient, actor, type_, group_key, post_id=post_id, comment_id=comment_id,
+                           reaction_type=reaction_type, milestone=milestone, once=once, _retry=False)
+        raise
 
 
 def record(recipient, actor, type_: str, *, post_id=None, comment_id=None,
@@ -96,10 +109,16 @@ def record(recipient, actor, type_: str, *, post_id=None, comment_id=None,
             return
         if is_blocked_either_way(recipient, actor):
             return
-        day = datetime.now(timezone.utc).date().isoformat()
-        target = comment_id if type_ == "liked_comment" else (post_id or "")
-        _upsert(recipient, actor, type_, f"{type_}:{target}:{day}",
-                post_id=post_id, comment_id=comment_id, reaction_type=reaction_type)
+        if type_ == "mentioned":
+            key = f"mentioned:comment:{comment_id}" if comment_id else f"mentioned:caption:{post_id}"
+            changed = _upsert(recipient, actor, type_, key, post_id=post_id, comment_id=comment_id, once=True)
+        else:
+            day = datetime.now(timezone.utc).date().isoformat()
+            target = comment_id if type_ == "liked_comment" else (post_id or "")
+            changed = _upsert(recipient, actor, type_, f"{type_}:{target}:{day}",
+                              post_id=post_id, comment_id=comment_id, reaction_type=reaction_type)
+        if changed:
+            enqueue_push(recipient, changed, type_)               # PUSH-1
     except Exception:
         logger.exception("activity record failed type=%s to=%s", type_, recipient)
 
@@ -108,8 +127,11 @@ def record_reaction(owner, actor, post_id, reaction_type: str, total_reactions: 
     record(owner, actor, "reacted", post_id=post_id, reaction_type=reaction_type)
     if total_reactions in MILESTONES:
         try:
-            _upsert(str(owner), None, "milestone", f"milestone:{post_id}:{total_reactions}",
-                    post_id=post_id, milestone={"kind": "reactions", "value": total_reactions})
+            changed = _upsert(str(owner), None, "milestone", f"milestone:{post_id}:{total_reactions}",
+                              post_id=post_id, milestone={"kind": "reactions", "value": total_reactions},
+                              once=True)
+            if changed:
+                enqueue_push(str(owner), changed, "milestone")    # PUSH-1
         except Exception:
             logger.exception("activity milestone failed post=%s", post_id)
 
@@ -133,6 +155,13 @@ def record_comment(comment: dict, post_owner, parent_author=None) -> None:
 
 
 # ---------------------------------------------------------------- read
+
+def _preview(text: str | None) -> str | None:
+    text = text or ""
+    if not text:
+        return None
+    return text if len(text) <= PREVIEW_LEN else text[:PREVIEW_LEN - 1] + "\u2026"
+
 
 def list_activity(user_id, cursor: str | None = None, limit: int = DEFAULT_PAGE) -> dict:
     # Imported here to avoid circular imports.
@@ -158,7 +187,7 @@ def list_activity(user_id, cursor: str | None = None, limit: int = DEFAULT_PAGE)
 
     posts = {}
     if post_ids:
-        for p in supabase.table("outfits").select("outfit_id, user_id, is_public, item_ids")\
+        for p in supabase.table("outfits").select("outfit_id, user_id, is_public, item_ids, caption")\
                 .in_("outfit_id", post_ids).execute().data or []:
             posts[str(p["outfit_id"])] = p
     pieces = _get_bulk_item_details(list({i for p in posts.values()
@@ -189,21 +218,29 @@ def list_activity(user_id, cursor: str | None = None, limit: int = DEFAULT_PAGE)
                     "items": [pieces.get(i, {"item_id": i, "deleted": True})
                               for i in (p.get("item_ids") or [])[:PREVIEW_PIECES]]}
         comment = None
+        text_preview = None
         if r.get("comment_id"):
             c = comments.get(str(r["comment_id"]))
             if not c or c.get("deleted"):
                 continue                               # comment removed
-            text = c.get("text") or ""
-            comment = {"comment_id": str(c["comment_id"]),
-                       "text_preview": text if len(text) <= PREVIEW_LEN else text[:PREVIEW_LEN - 1] + "\u2026"}
+            text_preview = _preview(c.get("text"))
+            comment = {"comment_id": str(c["comment_id"]), "text_preview": text_preview or ""}
+        elif r["type"] == "mentioned" and post:
+            # Caption mention: preview the caption. Removed from the caption -> still shown.
+            text_preview = _preview(posts[str(r["post_id"])].get("caption"))
         hidden_count = len([a for a in (r.get("actor_ids") or []) if str(a) in excluded])
+        shown = [people[a] for a in actors[:SHOWN_ACTORS] if a in people]
         items.append({
             "activity_id": str(r["activity_id"]),
             "type": r["type"],
-            "actors": [people[a] for a in actors[:SHOWN_ACTORS] if a in people],
+            "actors": shown,
+            "actor": shown[0] if shown else None,          # MENTION-CAPTION-1 (= actors[0])
             "actor_count": max(len(actors), int(r.get("actor_count") or 0) - hidden_count),
             "post": post,
             "comment": comment,
+            "post_id": post["post_id"] if post else None,
+            "comment_id": comment["comment_id"] if comment else None,
+            "text_preview": text_preview,
             "reaction_type": r.get("reaction_type"),
             "milestone": r.get("milestone"),
             "created_at": r["updated_at"],

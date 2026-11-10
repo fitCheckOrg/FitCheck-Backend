@@ -14,7 +14,7 @@ from api.subscription import router as subscription_router
 from api.config import router as config_router
 from api.tryon import router as tryon_router
 from api.weather import router as weather_router
-from api.collections import router as collections_router
+from api.collections import router as collections_router, users_router as user_collections_router
 from api.users import router as users_router
 from api.comments import router as comments_router, post_router as post_comments_router
 from api.activity import router as activity_router
@@ -24,12 +24,22 @@ from api.suggested import router as suggested_router
 from api.recreate import router as recreate_router
 from api.insights import router as insights_router
 from api.share_page import router as share_page_router
+from api.push import router as push_router
+from api.notes import router as notes_router
+from pipelines.push_pipeline import push_worker
+import asyncio
 
 
 # Retry a Supabase query once when the connection drops (see core/storage/db_retry.py).
 install_db_retry()
 
 app = FastAPI(title="FitCheck AI Service")
+
+
+# PUSH-1: background loop that sends due pushes (off when Firebase isn't configured).
+@app.on_event("startup")
+async def start_push_worker():
+    asyncio.create_task(push_worker())
 
 # Global exception handler - no try/except in routes
 @app.exception_handler(FitCheckException)
@@ -97,6 +107,12 @@ app.include_router(tryon_router, prefix="/api")
 app.include_router(weather_router, prefix="/api")
 app.include_router(collections_router, prefix="/api")
 app.include_router(users_router, prefix="/api")
+# COLLECTIONS-PUBLIC-1: GET /api/users/{user_id}/collections
+app.include_router(user_collections_router, prefix="/api")
+# PUSH-1: /api/users/me/devices + /api/users/me/notification-settings
+app.include_router(push_router, prefix="/api")
+# NOTE-1: Fit Notes
+app.include_router(notes_router, prefix="/api")
 app.include_router(comments_router, prefix="/api")
 app.include_router(post_comments_router, prefix="/api")
 app.include_router(activity_router, prefix="/api")

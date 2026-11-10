@@ -9,8 +9,13 @@ posts     every word of q must appear (as a word start) in the post's caption,
           "black blazer" matches a post with a black piece and a blazer.
           Ranked by how many words hit the pieces + caption, then reactions in
           the last 7 days, then newest. Searches the newest POST_CANDIDATES posts.
-creators  handle starts with q (@ optional) or any word of the name starts with q.
-          Most followers first. Each row = user + counts {followers}.
+creators  (SEARCH-NAME-1, 2026-11-06) handle starts with q (@ optional) or any
+          word of the name starts with q - case- and accent-insensitive
+          ("ife" finds a name written with Yoruba accents, "oka" finds "Ada Okafor"). Uses profiles.search_name
+          (lowercase, no accents, kept up to date by a DB trigger) + trigram indexes.
+          Rank: exact handle -> handle prefix -> name-word prefix, then most
+          followers, then most recent post. Never me, never blocked / hidden.
+          Each row = user + counts {followers}.
 styles    the Discover categories whose name / label starts with q, with post_count.
 
 Never: posts under review, blocked / hidden people, posts marked not interested.
@@ -19,6 +24,7 @@ Never: posts under review, blocked / hidden people, posts marked not interested.
 import base64
 import logging
 import re
+import unicodedata
 
 from core.storage.supabase_client import supabase
 from shared.exceptions import FitCheckException
@@ -161,26 +167,51 @@ def search_posts(q: str, viewer: str, cursor, limit) -> dict:
 
 # ---------------------------------------------------------------- creators
 
-def search_creators(q: str, viewer: str, cursor, limit) -> dict:
-    from pipelines.users_pipeline import build_users, _search_term   # avoid circular import
+def _plain(text) -> str:
+    """'  @Ada Okafor ' -> 'ada okafor': lowercase, accents removed, safe characters only."""
+    t = unicodedata.normalize("NFKD", str(text or "").strip().lstrip("@"))
+    t = "".join(ch for ch in t if not unicodedata.combining(ch)).lower()
+    t = re.sub(r"[^a-z0-9_. '\-]", "", t)
+    return " ".join(t.split())[:40]
 
-    term = _search_term(q)
+
+def search_creators(q: str, viewer: str, cursor, limit) -> dict:
+    from pipelines.users_pipeline import build_users   # avoid circular import
+
+    term = _plain(q)
     if len(term) < MIN_QUERY:
         return {"items": [], "next_cursor": None}
-    rows = supabase.table("profiles").select("id")\
-        .or_(f'handle.ilike."{term}*",full_name.ilike."{term}*",full_name.ilike."* {term}*"')\
+    rows = supabase.table("profiles").select("id, handle, search_name")\
+        .or_(f'handle.ilike."{term}*",search_name.ilike."{term}*",search_name.ilike."* {term}*"')\
         .limit(CREATOR_CANDIDATES).execute().data or []
-    excluded = excluded_user_ids(viewer)
-    ids = [str(r["id"]) for r in rows if str(r["id"]) not in excluded]
+    skip = excluded_user_ids(viewer) | {viewer}
+    rows = [r for r in rows if str(r["id"]) not in skip]
+    ids = [str(r["id"]) for r in rows]
 
     followers: dict[str, int] = {i: 0 for i in ids}
+    latest: dict[str, str] = {}
     for part in _chunks(ids):
         for f in supabase.table("follows").select("following_id")\
                 .in_("following_id", part).execute().data or []:
             fid = str(f["following_id"])
             followers[fid] = followers.get(fid, 0) + 1
+        for p in supabase.table("outfits").select("user_id, published_at")\
+                .in_("user_id", part).eq("is_public", True).execute().data or []:
+            uid, ts = str(p["user_id"]), str(p.get("published_at") or "")
+            if ts > latest.get(uid, ""):
+                latest[uid] = ts
 
-    ids.sort(key=lambda i: followers.get(i, 0), reverse=True)
+    def tier(r: dict) -> int:
+        handle = (r.get("handle") or "").lower()
+        if handle == term:
+            return 0
+        if handle.startswith(term):
+            return 1
+        return 2                                         # matched a word of the name
+
+    by_id = {str(r["id"]): r for r in rows}
+    ids.sort(key=lambda i: latest.get(i, ""), reverse=True)                  # 3rd: most recent post
+    ids.sort(key=lambda i: (tier(by_id[i]), -followers.get(i, 0)))           # 1st tier, 2nd followers
     page_ids, nxt = _page(ids, cursor, limit)
     people = build_users(page_ids, viewer)
     items = []

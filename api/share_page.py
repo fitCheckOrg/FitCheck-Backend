@@ -4,7 +4,7 @@ pipelines/share_page_pipeline.py. Included in main.py WITHOUT the /api prefix.
 
 GET /p/{post_id}         HTML page
 GET /p/{post_id}/og.png  Open Graph image (collage only)
-GET /u/{handle}          public profile page
+GET /u/{handle}          public profile page (PROFILE-SHARE-1: collages only, never a photo)
 GET /.well-known/assetlinks.json
 GET /.well-known/apple-app-site-association
 """
@@ -41,7 +41,7 @@ def share_post_image(post_id: UUID):
 def share_profile_page(handle: str):
     page = profile_page(handle)
     if not page:
-        return HTMLResponse(not_found_page(), status_code=404)
+        return HTMLResponse(not_found_page("profile"), status_code=404)
     return HTMLResponse(page, headers={"Cache-Control": "public, max-age=300"})
 
 
