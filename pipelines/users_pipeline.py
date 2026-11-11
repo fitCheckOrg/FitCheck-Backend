@@ -21,6 +21,8 @@ Handles (profiles.handle):
       every HANDLE_CHANGE_DAYS days.
 
 PROFILE-SHARE-1: public_profile includes share_url (.../u/{handle}, null with no handle).
+NOTE-1: public_profile includes active_note (the live Fit Note, followers + author only) or null.
+NOTE-PUSH-1: public_profile includes note_alerts (true/false for people I follow, else null).
 Public profile (B10): profiles.bio (<=150), city (<=40), style_tags (<=5 from
 STYLE_TAGS). Counts are live: public posts, followers, following, reactions
 received on public posts.
@@ -296,6 +298,8 @@ def public_profile(target_id, viewer_id) -> dict:
         # PROFILE-SHARE-1: public page link; null until the user has a handle.
         "share_url": profile_url(user["handle"]) if user.get("handle") else None,
         "active_note": _active_note(uid, viewer),
+        # NOTE-PUSH-1: only meaningful for people I follow (never shown to them).
+        "note_alerts": _note_alerts(viewer, uid) if user.get("is_following") and uid != viewer else None,
     }
 
 
@@ -306,6 +310,16 @@ def _active_note(owner: str, viewer: str):
         return active_note_for_profile(owner, viewer)
     except Exception:
         logger.exception("active_note failed owner=%s", owner)
+        return None
+
+
+def _note_alerts(viewer: str, owner: str):
+    """NOTE-PUSH-1: False when I muted this person's note alerts."""
+    try:
+        from pipelines.push_pipeline import note_alerts_on
+        return note_alerts_on(viewer, owner)
+    except Exception:
+        logger.exception("note_alerts failed owner=%s", owner)
         return None
 
 

@@ -38,8 +38,11 @@ Rules enforced here (not only in the app):
     * Text: <= 60 user-perceived characters (Unicode grapheme clusters, via the
       `regex` package's grapheme matcher) after trimming.
     * Reactions list: newest first, ties by user_id (desc); the cursor is that pair.
-    * No view tracking. No push for a new note. Reaction pushes follow
-      notification-settings like post reactions (activity type note_reacted).
+    * No view tracking. Reaction pushes follow notification-settings like post
+      reactions (activity type note_reacted).
+    * NOTE-PUSH-1 (2026-11-11): a new note pushes to followers ("Ada shared a Fit
+      Note") - fan-out, limits and checks live in push_pipeline / queue_note_pushes.
+      No bell row. Runs in the background; posting never waits.
     * Reactions refused on expired (410) / missing (404) notes and on your own.
 """
 
@@ -456,6 +459,8 @@ def create_note(user_id, body: dict) -> dict:
         raise
     row = res.data[0] if isinstance(res.data, list) else res.data
     logger.info("fit note posted user=%s kind=%s pieces=%s", me, kind, len(pieces))
+    from pipelines.push_pipeline import queue_note_pushes
+    queue_note_pushes(me, row["id"])                       # NOTE-PUSH-1, background
     return _shape([row], me)[0]
 
 

@@ -29,7 +29,15 @@ Approved rules (Keji, 2026-11-06):
       People the receiver blocked / hid (or who blocked them) never appear.
     * Tokens FCM reports as unregistered / invalid are deleted.
     * NOTE-1: note_reacted is a reaction (digest + quiet hours); never pushed once
-      the note is expired or deleted. A new note is never pushed.
+      the note is expired or deleted.
+    * NOTE-PUSH-1 (2026-11-11, Keji changed the NOTE-1 rule): a NEW Fit Note pushes
+      to the author's followers ("Ada shared a Fit Note"), with NO bell row.
+      Fan-out happens in ONE database call (queue_note_pushes) in the background:
+      followers only, not blocked / hidden either way, `notes` setting on, author
+      not muted, at most 1 per (receiver, author, receiver-local day) and 3 per
+      receiver per local day (note_push_log), quiet hours respected. Just before
+      sending: note still live, receiver can still see it, setting still on, not
+      muted - else dropped. Held ones fold into the "While you were away" summary.
 """
 
 import asyncio
@@ -60,11 +68,12 @@ SETTING_FOR_TYPE = {
     "mentioned": "mentions",
     "reacted": "reactions", "liked_comment": "reactions", "milestone": "reactions",
     "note_reacted": "reactions",                      # NOTE-1
+    "note_posted": "notes",                           # NOTE-PUSH-1 (no bell row)
 }
 DEFAULT_SETTINGS = {
     "follows": True, "comments": True, "mentions": True, "reactions": True,
     "reactions_mode": "digest", "quiet_hours": True, "quiet_start": 22, "quiet_end": 7,
-    "tz": None,
+    "tz": None, "notes": True,
 }
 DEFAULT_TZ = os.getenv("PUSH_DEFAULT_TZ") or "Africa/Lagos"
 TICK_SECONDS = 15
@@ -200,9 +209,11 @@ def _save_settings(user_id: str, updates: dict) -> None:
 def update_settings(user_id, sent: dict) -> dict:
     me = str(user_id)
     updates = {}
-    for key in ("follows", "comments", "mentions", "reactions", "quiet_hours"):
+    for key in ("follows", "comments", "mentions", "reactions", "quiet_hours", "notes"):
         if key in sent and sent[key] is not None:
-            updates[key] = bool(sent[key])
+            if not isinstance(sent[key], bool):
+                raise _bad("SETTING_INVALID", f"{key} must be true or false.")
+            updates[key] = sent[key]
     if sent.get("reactions_mode") is not None:
         mode = str(sent["reactions_mode"]).lower()
         if mode not in REACTION_MODES:
@@ -222,6 +233,86 @@ def update_settings(user_id, sent: dict) -> dict:
     if updates:
         _save_settings(me, updates)
     return get_settings(me)
+
+
+# ---------------------------------------------------------------- NOTE-PUSH-1: note alerts
+
+def note_alerts_on(viewer, owner) -> bool:
+    """False when `viewer` muted `owner`'s new-note pushes."""
+    rows = supabase.table("note_alert_mutes").select("user_id")\
+        .eq("user_id", str(viewer)).eq("muted_user_id", str(owner)).limit(1).execute().data
+    return not rows
+
+
+def set_note_alerts(user_id, target_id, on: bool) -> dict:
+    """PUT (on) / DELETE (muted). Silent: the other person is never told.
+    Kept across unfollow / follow."""
+    from pipelines.safety_pipeline import is_blocked_either_way
+    me, them = str(user_id), str(target_id)
+    if me == them:
+        raise _bad("CANNOT_MUTE_SELF", "You can't mute yourself.")
+    exists = supabase.table("profiles").select("id").eq("id", them).limit(1).execute().data
+    if not exists or is_blocked_either_way(me, them):
+        raise _bad("USER_NOT_FOUND", "User not found.", 404)
+    if on:
+        supabase.table("note_alert_mutes").delete()\
+            .eq("user_id", me).eq("muted_user_id", them).execute()
+    else:
+        try:
+            supabase.table("note_alert_mutes").insert({"user_id": me, "muted_user_id": them}).execute()
+        except APIError as exc:
+            if getattr(exc, "code", None) != "23505":      # already muted
+                raise
+    return {"user_id": them, "note_alerts": bool(on)}
+
+
+def queue_note_pushes(author_id, note_id) -> None:
+    """After a note is posted: fan out in the background (POST /notes never waits)."""
+    if not enabled():
+        return
+
+    def _run():
+        try:
+            res = supabase.rpc("queue_note_pushes", {"p_author": str(author_id),
+                                                     "p_note": str(note_id)}).execute()
+            logger.info("note pushes queued author=%s note=%s count=%s", author_id, note_id, res.data)
+        except Exception:
+            logger.exception("note push fan-out failed author=%s note=%s", author_id, note_id)
+    threading.Thread(target=_run, daemon=True).start()
+
+
+def _deliverable_notes(rows: list[dict], viewer: str) -> list[dict]:
+    """Queued note_posted rows -> items, only if the note is still live and the
+    receiver could still open it (follows, not blocked / hidden either way, not muted)."""
+    from pipelines.safety_pipeline import excluded_user_ids
+    from pipelines.users_pipeline import build_users
+    from pipelines.notes_pipeline import live_note_ids
+    if not rows:
+        return []
+    live = live_note_ids([r.get("note_id") for r in rows])
+    authors = list({str(r["actor_id"]) for r in rows if r.get("actor_id")})
+    if not authors:
+        return []
+    excluded = excluded_user_ids(viewer)
+    follows = supabase.table("follows").select("following_id")\
+        .eq("follower_id", viewer).in_("following_id", authors).execute().data or []
+    following = {str(f["following_id"]) for f in follows}
+    hid_me = supabase.table("user_hides").select("user_id")\
+        .eq("hidden_id", viewer).in_("user_id", authors).execute().data or []
+    hidden_by = {str(h["user_id"]) for h in hid_me}           # the author hid me
+    muted = supabase.table("note_alert_mutes").select("muted_user_id")\
+        .eq("user_id", viewer).in_("muted_user_id", authors).execute().data or []
+    muted_ids = {str(m["muted_user_id"]) for m in muted}
+    people = build_users(authors, viewer)
+    out = []
+    for r in rows:
+        author = str(r.get("actor_id"))
+        if str(r.get("note_id")) not in live or author in excluded or author in hidden_by \
+                or author not in following or author in muted_ids:
+            continue
+        out.append({"type": "note_posted", "activity": None, "names": [_name(people.get(author))],
+                    "count": 1, "post_id": None, "note_id": str(r["note_id"]), "actor_id": author})
+    return out
 
 
 # ---------------------------------------------------------------- quiet hours
@@ -374,6 +465,8 @@ def _text(item: dict) -> tuple[str, str]:
         return "Comment liked", f"{who} liked your comment"
     if t == "note_reacted":
         return "New reactions", f"{who} reacted to your note"
+    if t == "note_posted":
+        return "New Fit Note", f"{who} shared a Fit Note"
     if t == "milestone":
         value = (item["activity"].get("milestone") or {}).get("value")
         return "Milestone", f"Your look reached {value} reactions" if value else "Your look hit a milestone"
@@ -393,6 +486,10 @@ def _summary(items: list[dict]) -> tuple[str, str]:
     milestones = len([i for i in items if i["type"] == "milestone"])
     if milestones:
         parts.append(f"{milestones} milestone{'' if milestones == 1 else 's'}")
+    sharers = len({i["actor_id"] for i in items if i["type"] == "note_posted"})
+    if sharers:
+        parts.append(f"{sharers} {'person' if sharers == 1 else 'people'} you follow shared "
+                     f"{'a note' if sharers == 1 else 'notes'}")
     return "While you were away", " · ".join(parts) or "You have new activity"
 
 
@@ -457,7 +554,7 @@ def process_due() -> int:
     """One pass: send everything due. Returns how many queue rows were handled."""
     if _firebase() is None:
         return 0
-    due = supabase.table("push_queue").select("push_id, user_id, activity_id, type")\
+    due = supabase.table("push_queue").select("push_id, user_id, activity_id, type, note_id, actor_id")\
         .eq("status", "pending").lte("send_after", _iso(_now()))\
         .order("send_after").limit(BATCH).execute().data or []
     if not due:
@@ -477,13 +574,20 @@ def process_due() -> int:
         try:
             settings = get_settings(uid)
             allowed = [r for r in claimed if settings.get(SETTING_FOR_TYPE.get(r["type"], ""), False)]
+            bell = [r for r in allowed if r.get("activity_id")]
+            notes = [r for r in allowed if r["type"] == "note_posted"]     # NOTE-PUSH-1, no bell row
             activity = supabase.table("activity").select("*")\
-                .in_("activity_id", [r["activity_id"] for r in allowed]).execute().data if allowed else []
-            items = _deliverable(activity or [], uid)
+                .in_("activity_id", [r["activity_id"] for r in bell]).execute().data if bell else []
+            items = _deliverable(activity or [], uid) + _deliverable_notes(notes, uid)
             if not items:
                 _finish(ids, "skipped", "nothing_visible")
                 continue
-            if len(items) == 1:
+            if len(items) == 1 and items[0]["type"] == "note_posted":
+                item = items[0]
+                title, body = _text(item)
+                data = {"type": "note_posted", "note_id": item["note_id"], "user_id": item["actor_id"]}
+                collapse = f"note_posted:{item['actor_id']}"
+            elif len(items) == 1:
                 item = items[0]
                 title, body = _text(item)
                 data = {"type": item["type"], "activity_id": item["activity"]["activity_id"],
