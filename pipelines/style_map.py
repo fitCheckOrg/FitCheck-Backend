@@ -2,35 +2,33 @@
 ONB-4 E (2026-11-14): which Discover post categories suit each style word and
 each "love to see" pick. Shared by suggested creators and the For you feed.
 
-Post categories (shared.models.enums.DiscoverCategory): editorial, streetwear,
-minimal, formal, vintage, afrocentric, date_night, y2k_revival, festival.
+Post categories (shared.models.enums.DiscoverCategory, A2 2026-10-31):
+everyday, work, night_out, date, formal, street, travel, sport, weekend.
 A category that doesn't exist simply never matches.
 """
 
 STYLE_TO_CATEGORIES = {
-    "casual": {"minimal", "streetwear"},
-    "minimalist": {"minimal"},
-    "streetwear": {"streetwear"},
-    "athleisure": {"streetwear"},
-    "sporty": {"streetwear"},
-    "smart_casual": {"minimal", "editorial"},
-    "business": {"formal", "minimal"},
+    "casual": {"everyday", "weekend"},
+    "minimalist": {"everyday", "work"},
+    "streetwear": {"street"},
+    "athleisure": {"sport", "everyday"},
+    "sporty": {"sport"},
+    "smart_casual": {"work", "date"},
+    "business": {"work"},
     "formal": {"formal"},
-    "old_money": {"formal", "vintage"},
-    "luxury": {"editorial", "formal"},
-    "avant_garde": {"editorial"},
-    "y2k": {"y2k_revival"},
-    "vintage": {"vintage"},
-    "contemporary": {"editorial", "minimal"},
-    "traditional": {"afrocentric"},
-    "gender_fluid": {"editorial"},
+    "old_money": {"formal", "date"},
+    "luxury": {"formal", "night_out"},
+    "avant_garde": {"night_out"},
+    "y2k": {"street", "night_out"},
+    "vintage": {"weekend"},
+    "contemporary": {"everyday", "work"},
+    "traditional": {"formal", "weekend"},
+    "gender_fluid": {"street"},
 }
 
 # setup.discover picks that point at a kind of post (the rest are about people / tips).
 DISCOVER_TO_CATEGORIES = {
-    "everyday": {"minimal", "streetwear"},
-    "photography": {"editorial"},
-    "new_collections": {"editorial"},
+    "everyday": {"everyday"},
 }
 
 

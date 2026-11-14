@@ -14,6 +14,8 @@ How a page is built:
            +3 per style word its creator shares with me
            +2 if its category suits one of my style words
            +1 if its category suits one of my "love to see" picks
+       My OWN posts never score (they'd always "share" my styles); they stay in
+       the feed with the rest.
        Posts that score > 0 come first (score, then reactions this week, then
        newest). Then the rest, most popular first (all-time reactions, then newest).
     4. No signals at all -> plain newest first (same as sort=recent), no tuned_to.
@@ -85,7 +87,7 @@ def for_you_feed(user_id, limit: int = 20, offset: int = 0, category: str | None
     contributions = {t: 0 for t in my_tags}
     if personal and pool:
         ids = [str(p["outfit_id"]) for p in pool]
-        creators = list({str(p["user_id"]) for p in pool})
+        creators = list({str(p["user_id"]) for p in pool} - {me})
         their_tags: dict[str, set[str]] = {}
         for part in _chunks(creators):
             for r in supabase.table("profiles").select("id, style_tags").in_("id", part).execute().data or []:
@@ -98,11 +100,14 @@ def for_you_feed(user_id, limit: int = 20, offset: int = 0, category: str | None
 
         scored, rest = [], []
         for p in pool:
-            pid, cat = str(p["outfit_id"]), p.get("category")
-            shared = set(my_tags) & their_tags.get(str(p["user_id"]), set())
-            s = 3 * len(shared) + (2 if cat in style_cats else 0) + (1 if cat in discover_cats else 0)
+            pid, cat, creator = str(p["outfit_id"]), p.get("category"), str(p["user_id"])
             r = rank.get(pid, {})
             when = str(p.get("published_at") or "")
+            if creator == me:                                    # my own posts never "match"
+                rest.append(((int(r.get("total_reactions") or 0), when), pid))
+                continue
+            shared = set(my_tags) & their_tags.get(creator, set())
+            s = 3 * len(shared) + (2 if cat in style_cats else 0) + (1 if cat in discover_cats else 0)
             if s > 0:
                 scored.append(((s, int(r.get("reactions_7d") or 0), when), pid))
                 for t in my_tags:
