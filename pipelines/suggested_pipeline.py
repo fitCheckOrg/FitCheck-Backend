@@ -16,12 +16,20 @@ Score for each creator:
     +1  per reaction their posts got in the last 7 days (cap 10)
     then most followers, then newest post.
 No signals (new user) -> it is simply "popular creators".
+
+ONB-4 D (2026-11-12): style words are the 16 ids from users_pipeline.STYLE_TAGS;
+stored `athletic` counts as `athleisure`.
+ONB-4 E (2026-11-14): "categories I like" now come from the shared style map
+(pipelines/style_map.py, real Discover categories) plus my setup "love to see"
+picks. Each item also has shared_styles: the style word ids we share (the app
+shows labels); reason keeps its text.
 """
 
 import logging
 
 from core.storage.supabase_client import supabase
 from pipelines.safety_pipeline import excluded_user_ids
+from pipelines.style_map import categories_for
 
 logger = logging.getLogger(__name__)
 
@@ -31,16 +39,6 @@ PREVIEW_POSTS = 3
 PREVIEW_PIECES = 3
 DEFAULT_LIMIT = 20
 MAX_LIMIT = 50
-STYLE_TO_CATEGORIES = {
-    "casual": {"everyday", "weekend"},
-    "formal": {"formal", "date"},
-    "streetwear": {"street"},
-    "business": {"work"},
-    "athletic": {"sport"},
-    "vintage": set(),
-}
-
-
 def _chunks(ids: list[str]):
     for i in range(0, len(ids), CHUNK):
         yield ids[i:i + CHUNK]
@@ -48,11 +46,11 @@ def _chunks(ids: list[str]):
 
 def _my_signals(me: str) -> tuple[set[str], set[str]]:
     """(my style tags, categories I like)."""
-    prof = supabase.table("profiles").select("style_tags").eq("id", me).limit(1).execute().data
-    tags = {str(t).lower() for t in ((prof[0].get("style_tags") if prof else None) or [])}
-    cats = set()
-    for t in tags:
-        cats |= STYLE_TO_CATEGORIES.get(t, set())
+    from pipelines.users_pipeline import normalize_style_tags
+    prof = supabase.table("profiles").select("style_tags, setup_discover").eq("id", me).limit(1).execute().data
+    row = prof[0] if prof else {}
+    tags = set(normalize_style_tags(row.get("style_tags")))
+    cats = categories_for(tags, row.get("setup_discover") or [])
     reacted = supabase.table("outfit_reactions").select("outfit_id")\
         .eq("user_id", me).order("created_at", desc=True).limit(50).execute().data or []
     ids = [str(r["outfit_id"]) for r in reacted]
@@ -67,6 +65,7 @@ def suggested_creators(user_id, limit: int = DEFAULT_LIMIT) -> dict:
     # Imported here to avoid circular imports.
     from pipelines.users_pipeline import build_users
     from api.social import _get_bulk_item_details
+    from pipelines.users_pipeline import normalize_style_tags
 
     me = str(user_id)
     limit = max(1, min(int(limit), MAX_LIMIT))
@@ -94,7 +93,7 @@ def suggested_creators(user_id, limit: int = DEFAULT_LIMIT) -> dict:
     followers: dict[str, int] = {c: 0 for c in creators}
     for part in _chunks(creators):
         for r in supabase.table("profiles").select("id, style_tags").in_("id", part).execute().data or []:
-            their_tags[str(r["id"])] = {str(t).lower() for t in (r.get("style_tags") or [])}
+            their_tags[str(r["id"])] = set(normalize_style_tags(r.get("style_tags")))
         for f in supabase.table("follows").select("following_id").in_("following_id", part).execute().data or []:
             followers[str(f["following_id"])] = followers.get(str(f["following_id"]), 0) + 1
 
@@ -146,5 +145,6 @@ def suggested_creators(user_id, limit: int = DEFAULT_LIMIT) -> dict:
                           for i in (p.get("item_ids") or [])[:PREVIEW_PIECES]],
             } for p in preview[c]],
             "reason": reason,
+            "shared_styles": shared,
         })
     return {"items": items}

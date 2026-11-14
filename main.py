@@ -26,6 +26,7 @@ from api.insights import router as insights_router
 from api.share_page import router as share_page_router
 from api.push import router as push_router
 from api.notes import router as notes_router
+from api.for_you import router as for_you_router
 from pipelines.push_pipeline import push_worker
 import asyncio
 
@@ -100,6 +101,8 @@ app.include_router(outfit_router, prefix="/api")
 app.include_router(stylist_router, prefix="/api")
 # E19: insights BEFORE social, so POST /social/posts/views isn't taken by /social/posts/{post_id}
 app.include_router(insights_router, prefix="/api")
+# ONB-4 E: GET /api/social/feed/for-you
+app.include_router(for_you_router, prefix="/api")
 app.include_router(social_router, prefix="/api")
 app.include_router(subscription_router, prefix="/api")
 app.include_router(config_router, prefix="/api")

@@ -26,6 +26,14 @@ NOTE-PUSH-1: public_profile includes note_alerts (true/false for people I follow
 Public profile (B10): profiles.bio (<=150), city (<=40), style_tags (<=5 from
 STYLE_TAGS). Counts are live: public posts, followers, following, reactions
 received on public posts.
+
+ONB-4 (2026-11-12):
+    * D: 16 style words (STYLE_TAGS). The old word `athletic` is accepted and
+      saved / returned as `athleisure`.
+    * F1: PATCH /users/me/public {display_name} (1-50 characters after trimming,
+      stored in profiles.full_name). Required - can't be cleared (400 NAME_INVALID).
+    * C: GET /users/me includes setup_status.
+    * Every profile change clears the Node service's /auth/me cache (profile_cache).
 """
 
 import base64
@@ -42,6 +50,7 @@ from core.storage.supabase_client import supabase
 from shared.exceptions import FitCheckException
 from pipelines.safety_pipeline import is_blocked_either_way, excluded_user_ids, not_in
 from pipelines.share_page_pipeline import profile_url
+from pipelines.profile_cache import invalidate_profile
 
 logger = logging.getLogger(__name__)
 
@@ -58,7 +67,20 @@ RESERVED_HANDLES = {
 MAX_BIO_LEN = 150
 MAX_CITY_LEN = 40
 MAX_STYLE_TAGS = 5
-STYLE_TAGS = ("casual", "formal", "streetwear", "business", "athletic", "vintage")
+MAX_NAME_LEN = 50
+# ONB-4 D: the 16 style words (ids; the app shows the labels).
+STYLE_TAGS = ("casual", "minimalist", "streetwear", "athleisure", "sporty", "smart_casual",
+              "business", "formal", "old_money", "luxury", "avant_garde", "y2k",
+              "vintage", "contemporary", "traditional", "gender_fluid")
+STYLE_ALIASES = {"athletic": "athleisure"}          # old word -> new id
+STYLE_LABELS = {
+    "casual": "Casual", "minimalist": "Minimalist", "streetwear": "Streetwear",
+    "athleisure": "Athleisure", "sporty": "Sporty", "smart_casual": "Smart casual",
+    "business": "Business", "formal": "Formal", "old_money": "Old money",
+    "luxury": "Luxury", "avant_garde": "Avant-garde", "y2k": "Y2K", "vintage": "Vintage",
+    "contemporary": "Contemporary", "traditional": "Traditional & cultural",
+    "gender_fluid": "Gender-fluid",
+}
 # letters (incl. accents/tone marks, e.g. Ile-Ife with Yoruba marks), spaces . ' -
 CITY_RE = re.compile(r"^[^\W\d_](?:[^\W\d_]|[\u0300-\u036f]|[ .'\-])*$", re.UNICODE)
 DEFAULT_PAGE = 20
@@ -74,6 +96,16 @@ def _bad(code: str, message: str, status: int = 400) -> FitCheckException:
 
 def _user_not_found() -> FitCheckException:
     return _bad("USER_NOT_FOUND", "User not found.", 404)
+
+
+def normalize_style_tags(tags) -> list[str]:
+    """Stored / old values -> current ids (athletic -> athleisure), unknown dropped."""
+    out = []
+    for t in (tags or []):
+        tag = STYLE_ALIASES.get(str(t or "").strip().lower(), str(t or "").strip().lower())
+        if tag in STYLE_TAGS and tag not in out:
+            out.append(tag)
+    return out
 
 
 # ---------------------------------------------------------------- handles
@@ -172,7 +204,7 @@ def unknown_user(user_id: str, viewer_id: str) -> dict:
 # ---------------------------------------------------------------- me / lookup
 
 def _me_row(uid: str) -> dict:
-    res = supabase.table("profiles").select("id, handle, handle_changed_at")\
+    res = supabase.table("profiles").select("id, handle, handle_changed_at, setup_status")\
         .eq("id", uid).limit(1).execute()
     if not res.data:
         raise _user_not_found()
@@ -193,6 +225,7 @@ def get_me(user_id: UUID) -> dict:
     row = _me_row(uid)
     me = build_users([uid], uid).get(uid) or unknown_user(uid, uid)
     me["handle_can_change_at"] = _can_change_at(row)
+    me["setup_status"] = row.get("setup_status") or "legacy"          # ONB-4 C
     return me
 
 
@@ -231,6 +264,7 @@ def set_handle(user_id: UUID, raw) -> dict:
         if getattr(exc, "code", None) == "23505":   # taken by a parallel request
             raise _bad("HANDLE_TAKEN", "That handle is taken.", 409)
         raise
+    invalidate_profile(uid)
     logger.info("handle set user=%s handle=%s", uid, handle)
     return get_me(user_id)
 
@@ -286,7 +320,7 @@ def public_profile(target_id, viewer_id) -> dict:
         "user": user,
         "bio": row.get("bio"),
         "city": row.get("city"),
-        "style_tags": row.get("style_tags") or [],
+        "style_tags": normalize_style_tags(row.get("style_tags")),
         "counts": {
             "posts": _count("outfits", "outfit_id", user_id=uid, is_public=True),
             "followers": _count("follows", "follower_id", following_id=uid),
@@ -332,11 +366,18 @@ def public_profile_by_handle(raw, viewer_id) -> dict:
 
 
 def update_public_profile(user_id, sent: dict) -> dict:
-    """B10.3 - only the fields present in `sent` change. null / "" clears."""
+    """B10.3 - only the fields present in `sent` change. null / "" clears
+    (except display_name, which is required)."""
     uid = str(user_id)
     if not _profile_row(uid):
         raise _user_not_found()
     updates = {}
+
+    if "display_name" in sent:                                    # ONB-4 F1
+        name = " ".join(str(sent["display_name"] or "").split())
+        if not 1 <= len(name) <= MAX_NAME_LEN:
+            raise _bad("NAME_INVALID", f"Name must be 1-{MAX_NAME_LEN} characters.")
+        updates["full_name"] = name
 
     if "bio" in sent:
         bio = str(sent["bio"] or "").strip()
@@ -355,6 +396,7 @@ def update_public_profile(user_id, sent: dict) -> dict:
         tags = []
         for t in (sent["style_tags"] or []):
             tag = str(t or "").strip().lower()
+            tag = STYLE_ALIASES.get(tag, tag)                     # athletic -> athleisure
             if tag not in STYLE_TAGS:
                 raise _bad("STYLE_TAG_INVALID",
                            f"Style tags must be from: {', '.join(STYLE_TAGS)}.")
@@ -366,6 +408,7 @@ def update_public_profile(user_id, sent: dict) -> dict:
 
     if updates:
         supabase.table("profiles").update(updates).eq("id", uid).execute()
+        invalidate_profile(uid)
     return public_profile(uid, uid)
 
 

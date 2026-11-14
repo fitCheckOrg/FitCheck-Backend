@@ -33,7 +33,17 @@ POST/DELETE /api/users/{user_id}/hide     -> {hidden, user_id}
 GET         /api/users/me/blocked?cursor= -> {items: [user], next_cursor}
 POST        /api/users/{user_id}/report  {reason, note?} -> {reported: true}
 
-Errors: 400 HANDLE_INVALID | 400 HANDLE_RESERVED | 409 HANDLE_TAKEN |
+ONB-4 (2026-11-12):
+GET   /api/users/me/setup            -> {status, step, completed, skipped, intents, discover, updated_at}
+PUT   /api/users/me/setup  {step?, completed?, skipped?, intents?, discover?} -> same
+POST  /api/users/me/setup/complete   -> same (status "complete")
+PATCH /api/users/me/public {display_name?, bio?, city?, style_tags?}   (F1 display_name)
+GET   /api/users/me also returns setup_status.
+style_tags: casual, minimalist, streetwear, athleisure, sporty, smart_casual, business,
+            formal, old_money, luxury, avant_garde, y2k, vintage, contemporary,
+            traditional, gender_fluid  (athletic is accepted and saved as athleisure)
+
+Errors: 400 SETUP_INVALID | 400 NAME_INVALID | 400 HANDLE_INVALID | 400 HANDLE_RESERVED | 409 HANDLE_TAKEN |
         429 HANDLE_CHANGE_TOO_SOON | 404 USER_NOT_FOUND |
         400 BIO_TOO_LONG | 400 CITY_INVALID | 400 STYLE_TAG_INVALID | 400 INVALID_CURSOR |
         400 PHOTO_INVALID | 413 PHOTO_TOO_LARGE |
@@ -57,6 +67,7 @@ from pipelines.profile_photo_pipeline import upload_profile_photo, delete_profil
 from pipelines.safety_pipeline import (
     block_user, unblock_user, list_blocked, hide_user, unhide_user, report_user,
 )
+from pipelines.setup_pipeline import get_setup, update_setup, complete_setup
 
 router = APIRouter(prefix="/users", tags=["Users"])
 
@@ -71,14 +82,23 @@ class ReportRequest(BaseModel):
 
 
 class UpdatePublicProfileRequest(BaseModel):
+    display_name: str | None = Field(default=None, max_length=200)     # ONB-4 F1
     bio: str | None = None
     city: str | None = None
     style_tags: list[str] | None = Field(default=None, max_length=20)
 
 
+class SetupRequest(BaseModel):                                          # ONB-4 C
+    step: str | None = Field(default=None, max_length=40)
+    completed: list[str] | None = Field(default=None, max_length=20)
+    skipped: list[str] | None = Field(default=None, max_length=20)
+    intents: list[str] | None = Field(default=None, max_length=20)
+    discover: list[str] | None = Field(default=None, max_length=20)
+
+
 @router.get("/health")
 def health():
-    return {"service": "users", "version": "1.4.0", "status": "healthy"}
+    return {"service": "users", "version": "1.5.0", "status": "healthy"}
 
 
 @router.get("/handle-available")
@@ -102,6 +122,25 @@ def update_me(body: UpdateMeRequest, user_id: UUID = Depends(get_current_user_id
 @router.get("/by-handle/{handle}")
 def read_by_handle(handle: str, user_id: UUID = Depends(get_current_user_id)):
     return SuccessResponse(data=get_by_handle(handle, user_id))
+
+
+# ---------------------------------------------------------------- ONB-4 C setup
+# Declared before the /{target_id}/... routes.
+
+@router.get("/me/setup")
+def read_my_setup(user_id: UUID = Depends(get_current_user_id)):
+    return SuccessResponse(data=get_setup(user_id))
+
+
+@router.put("/me/setup")
+def put_my_setup(body: SetupRequest, user_id: UUID = Depends(get_current_user_id)):
+    sent = {k: getattr(body, k) for k in body.model_fields_set}
+    return SuccessResponse(data=update_setup(user_id, sent))
+
+
+@router.post("/me/setup/complete")
+def post_my_setup_complete(user_id: UUID = Depends(get_current_user_id)):
+    return SuccessResponse(data=complete_setup(user_id))
 
 
 # ---------------------------------------------------------------- B10.4 photo
