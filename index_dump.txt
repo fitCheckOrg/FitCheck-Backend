@@ -1,0 +1,33 @@
+﻿import 'dotenv/config';
+import express from "express";
+import helmet from "helmet";
+import cors from "cors";
+import rateLimit from "express-rate-limit";
+import authRouter from "./src/auth/auth.routes.js";
+const app = express();
+
+const PORT = process.env.PORT || 3000;
+
+app.use(helmet())
+app.use(cors())
+app.use(express.json())
+
+const limiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 100,
+  message: { error: 'Too many requests, slow down' }
+})
+app.use('/api', limiter)
+
+app.get('/', (req, res) => {
+  res.json({
+    status: 'FitCheck API is running',
+    version: '1.0.0'
+  })
+})
+
+app.use('/api/auth', authRouter)
+
+app.listen(PORT, () => {
+  console.log(`FitCheck API running on port ${PORT}`)
+})
