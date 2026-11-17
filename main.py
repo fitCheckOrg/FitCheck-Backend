@@ -28,6 +28,7 @@ from api.push import router as push_router
 from api.notes import router as notes_router
 from api.for_you import router as for_you_router
 from pipelines.push_pipeline import push_worker
+from pipelines.render_worker import render_worker
 import asyncio
 
 
@@ -41,6 +42,12 @@ app = FastAPI(title="FitCheck AI Service")
 @app.on_event("startup")
 async def start_push_worker():
     asyncio.create_task(push_worker())
+
+
+# Try-On v2 T2-1 B2: background loop that renders try-on jobs.
+@app.on_event("startup")
+async def start_render_worker():
+    asyncio.create_task(render_worker())
 
 # Global exception handler - no try/except in routes
 @app.exception_handler(FitCheckException)

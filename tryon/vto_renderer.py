@@ -3,7 +3,16 @@ Try-on renderer: the ONLY module in the backend that knows which
 try-on model/provider we use.
 
     renderer = get_renderer()
-    png_bytes = renderer.render(person_image, garment_image, category="tops")
+    png_bytes = renderer.render(person_image, garment_image, category="tops")   # blocking
+
+Try-On v2 T2-1 B2 (2026-11-17) - the same provider, in steps, for the background
+worker (pipelines/render_worker.py):
+
+    request_id = renderer.submit(person_image, garment_image, category)   # returns at once
+    state      = renderer.poll(request_id)    # ("queued", pos) | ("running", None)
+                                              # | ("done", result_url) | ("error", message)
+    png_bytes  = renderer.fetch(result_url)   # download with retries (already paid for)
+    renderer.cancel(request_id)               # best effort
 
 person_image / garment_image can be PIL Images, raw bytes, or http(s) URLs.
 Swapping provider (another fal model, FASHN direct, self-hosted CatVTON)
@@ -13,6 +22,9 @@ Nothing else in the backend, and nothing in Flutter, changes.
 B-TRY-1 (2026-11-03): every download (input photos and the finished render)
 goes through _get_with_retry, so a short network drop (DNS getaddrinfo
 failure, connection reset, timeout, 5xx) no longer wastes a paid render.
+
+B2 speed fix (audit P4): the person photo is shrunk to PERSON_MAX_SIDE before it
+is sent (FASHN's output is 864x1296; the full upload photo was up to 6000 px).
 
 Smoke test (server must be running on :8000):
     python -m tryon.vto_renderer
@@ -39,6 +51,7 @@ VALID_CATEGORIES = {"tops", "bottoms", "one-pieces", "auto"}
 DOWNLOAD_ATTEMPTS = 4          # 1 try + 3 retries
 DOWNLOAD_TIMEOUT = 30          # seconds per attempt
 RETRY_WAITS = (2, 4, 8)        # seconds to wait before retry 1, 2, 3
+PERSON_MAX_SIDE = 1536         # px, longest side of the person photo sent to the model
 
 
 class TryOnRenderError(Exception):
@@ -111,10 +124,19 @@ def _flatten_on_white(img: Image.Image) -> Image.Image:
     return img.convert("RGB")
 
 
+def _shrink(img: Image.Image, max_side: int) -> Image.Image:
+    """Never upscale; keeps the aspect ratio."""
+    if max(img.size) <= max_side:
+        return img
+    out = img.copy()
+    out.thumbnail((max_side, max_side), Image.Resampling.LANCZOS)
+    return out
+
+
 def _data_uri(img: Image.Image, fmt: str) -> str:
     buf = io.BytesIO()
     if fmt == "JPEG":
-        img.convert("RGB").save(buf, format="JPEG", quality=95)
+        img.convert("RGB").save(buf, format="JPEG", quality=92)
         mime = "image/jpeg"
     else:
         img.save(buf, format="PNG")
@@ -135,6 +157,22 @@ class TryOnRenderer(ABC):
                category: str = "tops") -> bytes:
         ...
 
+    # Step API for the background worker (T2-1 B2).
+    @abstractmethod
+    def submit(self, person_image: ImageInput, garment_image: ImageInput,
+               category: str = "tops") -> str:
+        ...
+
+    @abstractmethod
+    def poll(self, request_id: str) -> tuple[str, object]:
+        ...
+
+    def fetch(self, result_url: str) -> bytes:
+        return _get_with_retry(result_url, "try-on result")
+
+    def cancel(self, request_id: str) -> None:
+        return None
+
 
 # ---------------------------------------------------------------- fal / FASHN
 
@@ -148,40 +186,90 @@ class FalFashnRenderer(TryOnRenderer):
         self.seed = seed
         self.mode = mode
 
-    def render(self, person_image: ImageInput, garment_image: ImageInput,
-               category: str = "tops") -> bytes:
+    def _arguments(self, person_image: ImageInput, garment_image: ImageInput, category: str) -> dict:
         if category not in VALID_CATEGORIES:
             raise ValueError(f"category must be one of {sorted(VALID_CATEGORIES)}, got {category!r}")
+        person = _shrink(_to_pil(person_image, "person photo").convert("RGB"), PERSON_MAX_SIDE)
+        garment = _flatten_on_white(_to_pil(garment_image, "garment photo"))
+        return {
+            "model_image": _data_uri(person, "JPEG"),
+            "garment_image": _data_uri(garment, "PNG"),
+            "category": category,
+            "garment_photo_type": "flat-lay",
+            "mode": self.mode,
+            "num_samples": 1,
+            "seed": self.seed,
+            "output_format": "png",
+        }
+
+    @staticmethod
+    def _image_url(result) -> str:
+        images = (result or {}).get("images") or []
+        if not images or not images[0].get("url"):
+            raise TryOnRenderError(f"no image in the result: {result}")
+        return images[0]["url"]
+
+    # -- blocking (old /tryon endpoints)
+
+    def render(self, person_image: ImageInput, garment_image: ImageInput,
+               category: str = "tops") -> bytes:
         _ensure_fal_key()
         import fal_client  # imported after FAL_KEY is guaranteed
 
-        person = _to_pil(person_image, "person photo").convert("RGB")
-        garment = _flatten_on_white(_to_pil(garment_image, "garment photo"))
-
+        arguments = self._arguments(person_image, garment_image, category)
         try:
-            result = fal_client.subscribe(
-                self.ENDPOINT,
-                arguments={
-                    "model_image": _data_uri(person, "JPEG"),
-                    "garment_image": _data_uri(garment, "PNG"),
-                    "category": category,
-                    "garment_photo_type": "flat-lay",
-                    "mode": self.mode,
-                    "num_samples": 1,
-                    "seed": self.seed,
-                    "output_format": "png",
-                },
-            )
+            result = fal_client.subscribe(self.ENDPOINT, arguments=arguments)
         except Exception as exc:  # fal raises its own HTTP error types
             raise TryOnRenderError(f"{self.name} request failed: {exc}") from exc
 
-        images = (result or {}).get("images") or []
-        if not images or not images[0].get("url"):
-            raise TryOnRenderError(f"{self.name} returned no image: {result}")
-
         # The render is already paid for at this point - retry the download
         # instead of failing and making the user render (and pay) again.
-        return _get_with_retry(images[0]["url"], "try-on result")
+        return self.fetch(self._image_url(result))
+
+    # -- steps (background worker)
+
+    def submit(self, person_image: ImageInput, garment_image: ImageInput,
+               category: str = "tops") -> str:
+        _ensure_fal_key()
+        import fal_client
+
+        arguments = self._arguments(person_image, garment_image, category)
+        try:
+            handle = fal_client.submit(self.ENDPOINT, arguments=arguments)
+        except Exception as exc:
+            raise TryOnRenderError(f"{self.name} submit failed: {exc}") from exc
+        return handle.request_id
+
+    def poll(self, request_id: str) -> tuple[str, object]:
+        _ensure_fal_key()
+        import fal_client
+
+        try:
+            status = fal_client.status(self.ENDPOINT, request_id)
+        except Exception as exc:
+            # A network blip while asking is not a failed render: ask again next time.
+            logger.warning("%s status check failed for %s: %s", self.name, request_id, exc)
+            return "running", None
+        if isinstance(status, fal_client.Queued):
+            return "queued", status.position
+        if isinstance(status, fal_client.InProgress):
+            return "running", None
+        if isinstance(status, fal_client.Completed):
+            if status.error:
+                return "error", f"{status.error_type or 'error'}: {status.error}"
+            try:
+                return "done", self._image_url(fal_client.result(self.ENDPOINT, request_id))
+            except Exception as exc:
+                return "error", f"could not read the result: {exc}"
+        return "running", None
+
+    def cancel(self, request_id: str) -> None:
+        try:
+            _ensure_fal_key()
+            import fal_client
+            fal_client.cancel(self.ENDPOINT, request_id)
+        except Exception as exc:
+            logger.info("%s cancel %s: %s", self.name, request_id, exc)
 
 
 # ---------------------------------------------------------------- factory
@@ -213,4 +301,4 @@ if __name__ == "__main__":
     out = Path("outputs/vto_spike/renderer_smoke.png")
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_bytes(png)
-    print(f"OK  {renderer.name}  {len(png)//1024} KB  {time.time()-t0:.1f}s  -> {out}")
+    print(f"OK  {renderer.name}  {len(png)//1024} KB  {_time.time()-t0:.1f}s  -> {out}")

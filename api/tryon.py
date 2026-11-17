@@ -28,6 +28,18 @@ GET  /api/tryon/outfits/{outfit_id}    -> outfit
             rendered_slots, tray_slots, needs_generations, cached_image, created_at}
   400 OUTFIT_EMPTY | SLOT_INVALID | SLOT_CONFLICT | FIT_INVALID
   404 OUTFIT_NOT_FOUND | CLOTHING_ITEM_NOT_FOUND
+
+Try-On v2 T2-1 B2 (2026-11-17) - render jobs (rendered in the background, see
+pipelines/render_worker.py):
+POST /api/tryon/jobs  {outfit_id} | {items: [...]}   -> 202 new job / 200 already rendered or on its way
+GET  /api/tryon/jobs/{job_id}                         -> job
+GET  /api/tryon/jobs?active=true                      -> {items: [job]}  (queued + running)
+POST /api/tryon/jobs/{job_id}/cancel                  -> job
+  job = {job_id, outfit_id, status, progress {step, steps}, queue_position, rendered_slots,
+         tray_slots, charged_generations, provider_started, failure {code, message} | null,
+         image | null, created_at, finished_at}
+  400 NOTHING_TO_RENDER | OUTFIT_EMPTY   404 JOB_NOT_FOUND | AVATAR_NOT_FOUND
+  429 RATE_LIMITED (2 renders on the way already)
 """
 
 import logging
@@ -42,6 +54,7 @@ from pipelines.tryon_pipeline import run_tryon_pipeline, run_outfit_tryon_pipeli
 from pipelines.tryon_looks_pipeline import save_look, list_looks, delete_look, rename_look
 from pipelines.tryon_slots import slots_payload
 from pipelines.tryon_outfits_pipeline import create_outfit, get_outfit
+from pipelines.render_jobs_pipeline import create_job, get_job, list_active, cancel_job
 
 logger = logging.getLogger(__name__)
 
@@ -79,9 +92,14 @@ class CreateOutfitRequest(BaseModel):
     items: list[OutfitItem] = Field(default_factory=list, max_length=20)
 
 
+class CreateJobRequest(BaseModel):                 # T2-1 B2
+    outfit_id: UUID | None = None
+    items: list[OutfitItem] | None = Field(default=None, max_length=20)
+
+
 @router.get("/health")
 async def health():
-    return {"service": "tryon", "version": "2.3.0", "status": "healthy"}
+    return {"service": "tryon", "version": "2.4.0", "status": "healthy"}
 
 
 # ---------------------------------------------------------------- T2-1 B1: slots + outfits
@@ -100,6 +118,32 @@ def post_outfit(body: CreateOutfitRequest, user_id: UUID = Depends(get_current_u
 @router.get("/outfits/{outfit_id}")
 def read_outfit(outfit_id: UUID, user_id: UUID = Depends(get_current_user_id)):
     return SuccessResponse(data=get_outfit(user_id, outfit_id))
+
+
+# ---------------------------------------------------------------- T2-1 B2: render jobs
+
+@router.post("/jobs")
+def post_job(body: CreateJobRequest, response: Response,
+             user_id: UUID = Depends(get_current_user_id)):
+    items = [{"garment_id": i.garment_id, "slot": i.slot, "fit": i.fit} for i in (body.items or [])]
+    job, created = create_job(user_id, body.outfit_id, items or None)
+    response.status_code = 202 if created else 200
+    return SuccessResponse(data=job)
+
+
+@router.get("/jobs")
+def read_active_jobs(active: bool = True, user_id: UUID = Depends(get_current_user_id)):
+    return SuccessResponse(data=list_active(user_id))
+
+
+@router.get("/jobs/{job_id}")
+def read_job(job_id: UUID, user_id: UUID = Depends(get_current_user_id)):
+    return SuccessResponse(data=get_job(user_id, job_id))
+
+
+@router.post("/jobs/{job_id}/cancel")
+def post_cancel_job(job_id: UUID, user_id: UUID = Depends(get_current_user_id)):
+    return SuccessResponse(data=cancel_job(user_id, job_id))
 
 
 @router.post("")
