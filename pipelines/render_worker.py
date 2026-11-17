@@ -19,11 +19,19 @@ in a thread:
 Cancelled while the provider is working: that step is still finished and cached
 (it's paid for), the job stays 'cancelled' and nothing more is started.
 A job's lease is renewed every pass; if the server dies the next claim picks it up
-again (at most MAX_ATTEMPTS times, then 'failed / timeout').
+again (at most MAX_ATTEMPTS times, then 'failed').
 
 B3 (2026-11-17): every generation records the job that sent it (submitted_by_job).
 A job is charged only when it SUCCEEDS - finish_render_job() marks it succeeded and
 charges each generation it sent, once (render_charges). Failed / cancelled: nothing.
+
+B3 fix (2026-11-17): a network blip no longer fails the job. When the connection
+drops (database, S3 or fal) and NOTHING was sent to the provider for the step, the
+job is parked for RETRY_DELAY seconds and picked up again (at most MAX_ATTEMPTS
+tries in all). Re-running is safe: a step that was already submitted is followed by
+its provider_request_id, never submitted again. An error AFTER fal may have
+received the request (not a connect error) still fails the step - retrying it
+could pay for the same render twice.
 """
 
 import asyncio
@@ -32,8 +40,11 @@ import os
 import time
 from datetime import datetime, timedelta, timezone
 
+import httpx
+import requests
 from postgrest.exceptions import APIError
 
+from core.storage.db_retry import DB_CONNECTION_ERRORS
 from core.storage.s3 import storage, S3Folders
 from core.storage.supabase_client import supabase
 
@@ -44,7 +55,8 @@ POLL_EVERY = 3
 STEP_TIMEOUT = 120
 WAIT_FOR_OTHERS = STEP_TIMEOUT + 60      # waiting for a render someone else is doing
 LEASE_SECONDS = 180
-MAX_ATTEMPTS = 2
+MAX_ATTEMPTS = 4                         # claims of one job (network retries + crash recoveries)
+RETRY_DELAY = 30                         # seconds a job waits after a network blip
 RENDERS = "tryon_renders"
 JOBS = "render_jobs"
 _running: set[str] = set()
@@ -71,6 +83,47 @@ def _parse(ts) -> datetime | None:
 
 class _Stop(Exception):
     """The job ended (failed / cancelled); stop working on it."""
+
+
+class _Retry(Exception):
+    """A network blip before anything was paid for; try the job again shortly."""
+
+
+# Connection problems (database, S3, fal) that are worth waiting out.
+_NETWORK_ERRORS = tuple({httpx.TransportError, requests.ConnectionError, requests.Timeout,
+                         *DB_CONNECTION_ERRORS})
+# Errors that prove the request never reached fal (safe to submit again).
+_NOT_CONNECTED = (httpx.ConnectError, httpx.ConnectTimeout, requests.ConnectionError)
+
+
+def _chain(exc: BaseException):
+    seen = set()
+    while exc is not None and id(exc) not in seen:
+        seen.add(id(exc))
+        yield exc
+        exc = exc.__cause__ or exc.__context__
+
+
+def _is_network(exc: BaseException) -> bool:
+    return any(isinstance(e, _NETWORK_ERRORS) for e in _chain(exc))
+
+
+def _not_sent(exc: BaseException) -> bool:
+    """True when a failed submit certainly never reached the provider: the photos
+    couldn't be downloaded (that happens before sending), or fal couldn't be reached."""
+    if "could not download" in str(exc):
+        return True
+    return any(isinstance(e, _NOT_CONNECTED) for e in _chain(exc))
+
+
+def _park(job_id: str, why: str) -> None:
+    """Leave the job running but let the next claim pick it up in RETRY_DELAY s."""
+    logger.warning("render job %s will retry in %ss: %s", job_id, RETRY_DELAY, why[:200])
+    try:
+        supabase.table(JOBS).update({"lease_until": _iso(_now() + timedelta(seconds=RETRY_DELAY))})\
+            .eq("job_id", job_id).eq("status", "running").execute()
+    except Exception:
+        pass        # database still down: the normal lease runs out and the job is picked up anyway
 
 
 # ---------------------------------------------------------------- job row helpers
@@ -161,18 +214,15 @@ def _step(job: dict, key: dict, person_url: str, garment: dict, category: str,
         request_id = row.get("provider_request_id") if row else None
         if row and row["status"] == "processing" and request_id:
             # Submitted already (by us before a crash, or by another job): follow it.
-            submitted = _parse(row.get("provider_submitted_at")) or _now()
-            if (_now() - submitted).total_seconds() > STEP_TIMEOUT:
-                renderer.cancel(request_id)
-                _row_failed(row["id"], "timeout")
-                if status == "cancelled":
-                    return None
-                _fail(job_id, "timeout", "The render took too long. You weren't charged.")
             state, value = renderer.poll(request_id)
             if state == "done":
                 try:
                     return _complete(row["id"], renderer.fetch(value), garment_ids)
                 except Exception as exc:
+                    if _is_network(exc) or "could not download" in str(exc):
+                        # Paid for and ready at the provider: keep the row as it is and
+                        # fetch it again after the blip (never render it a second time).
+                        raise _Retry(f"store not finished: {exc}")
                     _row_failed(row["id"], f"store failed: {exc}")
                     if status == "cancelled":
                         return None
@@ -182,6 +232,14 @@ def _step(job: dict, key: dict, person_url: str, garment: dict, category: str,
                 if status == "cancelled":
                     return None
                 _fail(job_id, "provider_error", "The render didn't work. You weren't charged.")
+            # still queued / running at the provider
+            submitted = _parse(row.get("provider_submitted_at")) or _now()
+            if (_now() - submitted).total_seconds() > STEP_TIMEOUT:
+                renderer.cancel(request_id)
+                _row_failed(row["id"], "timeout")
+                if status == "cancelled":
+                    return None
+                _fail(job_id, "timeout", "The render took too long. You weren't charged.")
             time.sleep(POLL_EVERY)
             continue
 
@@ -201,6 +259,8 @@ def _step(job: dict, key: dict, person_url: str, garment: dict, category: str,
             request_id = renderer.submit(person_url, garment["clean_image_url"], category)
         except (TryOnRenderError, Exception) as exc:
             _row_failed(row_id, f"submit failed: {exc}")
+            if _not_sent(exc):
+                raise _Retry(f"submit not sent: {exc}")
             _fail(job_id, "provider_error", "The render didn't start. You weren't charged.")
         supabase.table(RENDERS).update({"provider_request_id": request_id, "submitted_by_job": job_id,
                                         "provider_submitted_at": _iso(), "updated_at": _iso()})\
@@ -220,7 +280,7 @@ def run_job(job_id: str) -> None:
         if not job or job["status"] not in ("running", "cancelled"):
             return
         if int(job.get("attempts") or 0) > MAX_ATTEMPTS:
-            _fail(job_id, "timeout", "The render couldn't finish. You weren't charged.")
+            _fail(job_id, "provider_error", "The render couldn't finish. You weren't charged.")
         uid = str(job["user_id"])
 
         av = supabase.table("avatars").select("avatar_id, avatar_version, original_photo_url")\
@@ -258,7 +318,12 @@ def run_job(job_id: str) -> None:
             logger.info("render job %s finished after cancel in %.1fs (not charged)", job_id, time.time() - t0)
     except _Stop:
         pass
+    except _Retry as exc:
+        _park(job_id, str(exc))
     except Exception as exc:
+        if _is_network(exc):
+            _park(job_id, f"{type(exc).__name__}: {exc}")
+            return
         logger.exception("render job %s crashed", job_id)
         try:
             _fail(job_id, "provider_error", f"Something went wrong ({type(exc).__name__}). You weren't charged.")
