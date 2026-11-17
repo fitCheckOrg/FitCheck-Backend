@@ -26,6 +26,10 @@ failure, connection reset, timeout, 5xx) no longer wastes a paid render.
 B2 speed fix (audit P4): the person photo is shrunk to PERSON_MAX_SIDE before it
 is sent (FASHN's output is 864x1296; the full upload photo was up to 6000 px).
 
+B5 (2026-11-18): avatar photos and renders are PRIVATE in S3. A link to our own
+bucket is swapped for a fresh signed link before every download attempt, so the
+stored plain URLs (avatars.original_photo_url) keep working after the bucket is locked.
+
 Smoke test (server must be running on :8000):
     python -m tryon.vto_renderer
 """
@@ -79,10 +83,12 @@ def _get_with_retry(url: str, what: str) -> bytes:
     GET an image with retries on network hiccups and 5xx.
     4xx (e.g. 403/404 - the file really isn't there) fails at once.
     """
+    from core.storage.s3 import storage
     last_error = None
     for attempt in range(1, DOWNLOAD_ATTEMPTS + 1):
         try:
-            r = requests.get(url, timeout=DOWNLOAD_TIMEOUT)
+            link = storage.url_for(url) if url.startswith(storage.base) else url   # B5
+            r = requests.get(link, timeout=DOWNLOAD_TIMEOUT)
             if r.status_code == 200:
                 if attempt > 1:
                     logger.info("%s download succeeded on attempt %d", what, attempt)

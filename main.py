@@ -27,6 +27,8 @@ from api.share_page import router as share_page_router
 from api.push import router as push_router
 from api.notes import router as notes_router
 from api.for_you import router as for_you_router
+from api.media import router as media_router
+from core.storage.sign_middleware import SignPrivateLinks
 from pipelines.push_pipeline import push_worker
 from pipelines.render_worker import render_worker
 import asyncio
@@ -96,6 +98,9 @@ async def generic_exception_handler(request, exc):
         }
     )
 
+# Try-On v2 T2-1 B5: private images in JSON responses leave as signed links (1 hour).
+app.add_middleware(SignPrivateLinks)
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["http://localhost:3000", "http://10.0.2.2:3000"],
@@ -116,6 +121,8 @@ app.include_router(social_router, prefix="/api")
 app.include_router(subscription_router, prefix="/api")
 app.include_router(config_router, prefix="/api")
 app.include_router(tryon_router, prefix="/api")
+# Try-On v2 T2-1 B5: POST /api/media/sign
+app.include_router(media_router, prefix="/api")
 app.include_router(weather_router, prefix="/api")
 app.include_router(collections_router, prefix="/api")
 app.include_router(users_router, prefix="/api")

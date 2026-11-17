@@ -94,9 +94,10 @@ def _plan(items: list[dict]) -> tuple[list[dict], list[str], list[str]]:
 
 
 def _image(row: dict, avatar: dict, garment_ids: list[str]) -> dict:
-    """Image object. expires_at is null until private storage (B5)."""
-    return {"image_id": str(row["id"]), "key": row["s3_key"], "url": storage.get_url(row["s3_key"]),
-            "expires_at": None, "avatar_version": avatar["avatar_version"],
+    """Image object. B5: url is a signed link until expires_at (re-sign: POST /api/media/sign)."""
+    signed = storage.signed(row["s3_key"])
+    return {"image_id": str(row["id"]), "key": signed["key"], "url": signed["url"],
+            "expires_at": signed["expires_at"], "avatar_version": avatar["avatar_version"],
             "garment_ids": garment_ids, "outdated": None}
 
 

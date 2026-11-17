@@ -32,6 +32,11 @@ tries in all). Re-running is safe: a step that was already submitted is followed
 its provider_request_id, never submitted again. An error AFTER fal may have
 received the request (not a connect error) still fails the step - retrying it
 could pay for the same render twice.
+
+B4 (2026-11-17): when a job ends the owner's phones get a data-only push
+(pipelines/render_push.py): render_ready on success, render_failed {code} on failure.
+Sent once - only by the call that actually moved the job to succeeded / failed.
+Never for cancelled jobs or cache hits.
 """
 
 import asyncio
@@ -142,10 +147,13 @@ def _renew(job_id: str) -> str | None:
 
 def _fail(job_id: str, code: str, message: str) -> None:
     logger.warning("render job %s failed: %s %s", job_id, code, message)
-    supabase.table(JOBS).update({
+    rows = supabase.table(JOBS).update({
         "status": "failed", "failure_code": code, "failure_message": message[:300],
         "finished_at": _iso(), "lease_until": None,
-    }).eq("job_id", job_id).eq("status", "running").execute()
+    }).eq("job_id", job_id).eq("status", "running").execute().data
+    if rows:                                   # B4: only the call that failed it pushes
+        from pipelines.render_push import notify
+        notify(rows[0], ok=False, code=code)
     raise _Stop()
 
 
@@ -314,6 +322,8 @@ def run_job(job_id: str) -> None:
         charged = res.data[0] if isinstance(res.data, list) else res.data
         if charged is not None and int(charged) >= 0:
             logger.info("render job %s succeeded in %.1fs, charged %s", job_id, time.time() - t0, charged)
+            from pipelines.render_push import notify
+            notify(job, ok=True)
         else:
             logger.info("render job %s finished after cancel in %.1fs (not charged)", job_id, time.time() - t0)
     except _Stop:

@@ -9,6 +9,12 @@ Table: public.tryon_looks
     unique (user_id, tryon_key)  -> saving the same render twice returns
                                     the existing look (idempotent), 200
 
+Try-On v2 T2-1 B5 (2026-11-18): every look carries the image object
+    image: {image_id, key, url, expires_at, outdated}
+(url is a signed link for 1 hour; re-sign with POST /api/media/sign). image_url
+stays (same signed link) and tryon_key stays until the app has switched.
+image_id is the render's id (tryon_looks.render_id, set on save).
+
 Integrity checks on save:
     * tryon_key must be a COMPLETED render in tryon_renders owned by this user
     * the render's garment must be one of garment_ids
@@ -37,11 +43,15 @@ def _bad_request(message: str, code: str) -> FitCheckException:
 
 
 def _to_look(row: dict) -> dict:
+    signed = storage.signed(row["tryon_key"])
     return {
         "look_id": row["look_id"],
         "garment_ids": row["garment_ids"],
         "tryon_key": row["tryon_key"],
-        "image_url": storage.get_url(row["tryon_key"]),
+        "image_url": signed["url"],
+        "image": {"image_id": str(row["render_id"]) if row.get("render_id") else None,
+                  "key": signed["key"], "url": signed["url"], "expires_at": signed["expires_at"],
+                  "outdated": None},
         "name": row.get("name"),
         "created_at": row["created_at"],
     }
@@ -75,7 +85,7 @@ def save_look(user_id: UUID, garment_ids: list[UUID], tryon_key: str,
         raise _bad_request(f"Name must be {MAX_NAME_LEN} characters or fewer.", "LOOK_NAME_TOO_LONG")
 
     # --- the render must exist, be finished, and belong to this user
-    render = supabase.table("tryon_renders").select("garment_id")\
+    render = supabase.table("tryon_renders").select("id, garment_id")\
         .eq("user_id", uid).eq("s3_key", key).eq("status", "completed")\
         .limit(1).execute()
     if not render.data:
@@ -98,7 +108,8 @@ def save_look(user_id: UUID, garment_ids: list[UUID], tryon_key: str,
     if existing:
         return _to_look(existing), False
 
-    row = {"user_id": uid, "tryon_key": key, "garment_ids": ids, "name": clean_name}
+    row = {"user_id": uid, "tryon_key": key, "garment_ids": ids, "name": clean_name,
+           "render_id": render.data[0]["id"]}
     try:
         res = supabase.table(TABLE).insert(row).execute()
         logger.info("saved look user=%s key=%s items=%d", uid, key, len(ids))
