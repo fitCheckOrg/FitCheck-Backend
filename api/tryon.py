@@ -40,6 +40,13 @@ POST /api/tryon/jobs/{job_id}/cancel                  -> job
          image | null, created_at, finished_at}
   400 NOTHING_TO_RENDER | OUTFIT_EMPTY   404 JOB_NOT_FOUND | AVATAR_NOT_FOUND
   429 RATE_LIMITED (2 renders on the way already)
+
+Try-On v2 T2-1 B3 (2026-11-17) - quotas:
+GET  /api/tryon/usage   -> {period, used, reserved, limit, remaining, resets_at, tier}
+POST /api/tryon/jobs    also: 429 QUOTA_EXCEEDED {used, reserved, limit, needed, resets_at}
+                              429 RATE_LIMITED {retry_after} (2 active, or 30 creates / hour)
+                              503 RENDERS_PAUSED {retry_after} (daily ceiling, everyone)
+  Already-rendered outfits still open (200) when out of renders or paused.
 """
 
 import logging
@@ -54,7 +61,7 @@ from pipelines.tryon_pipeline import run_tryon_pipeline, run_outfit_tryon_pipeli
 from pipelines.tryon_looks_pipeline import save_look, list_looks, delete_look, rename_look
 from pipelines.tryon_slots import slots_payload
 from pipelines.tryon_outfits_pipeline import create_outfit, get_outfit
-from pipelines.render_jobs_pipeline import create_job, get_job, list_active, cancel_job
+from pipelines.render_jobs_pipeline import create_job, get_job, list_active, cancel_job, get_usage
 
 logger = logging.getLogger(__name__)
 
@@ -99,7 +106,7 @@ class CreateJobRequest(BaseModel):                 # T2-1 B2
 
 @router.get("/health")
 async def health():
-    return {"service": "tryon", "version": "2.4.0", "status": "healthy"}
+    return {"service": "tryon", "version": "2.5.0", "status": "healthy"}
 
 
 # ---------------------------------------------------------------- T2-1 B1: slots + outfits
@@ -129,6 +136,11 @@ def post_job(body: CreateJobRequest, response: Response,
     job, created = create_job(user_id, body.outfit_id, items or None)
     response.status_code = 202 if created else 200
     return SuccessResponse(data=job)
+
+
+@router.get("/usage")
+def read_usage(user_id: UUID = Depends(get_current_user_id)):
+    return SuccessResponse(data=get_usage(user_id))
 
 
 @router.get("/jobs")

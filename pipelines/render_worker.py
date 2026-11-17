@@ -20,6 +20,10 @@ Cancelled while the provider is working: that step is still finished and cached
 (it's paid for), the job stays 'cancelled' and nothing more is started.
 A job's lease is renewed every pass; if the server dies the next claim picks it up
 again (at most MAX_ATTEMPTS times, then 'failed / timeout').
+
+B3 (2026-11-17): every generation records the job that sent it (submitted_by_job).
+A job is charged only when it SUCCEEDS - finish_render_job() marks it succeeded and
+charges each generation it sent, once (render_charges). Failed / cancelled: nothing.
 """
 
 import asyncio
@@ -198,7 +202,7 @@ def _step(job: dict, key: dict, person_url: str, garment: dict, category: str,
         except (TryOnRenderError, Exception) as exc:
             _row_failed(row_id, f"submit failed: {exc}")
             _fail(job_id, "provider_error", "The render didn't start. You weren't charged.")
-        supabase.table(RENDERS).update({"provider_request_id": request_id,
+        supabase.table(RENDERS).update({"provider_request_id": request_id, "submitted_by_job": job_id,
                                         "provider_submitted_at": _iso(), "updated_at": _iso()})\
             .eq("id", row_id).execute()
         supabase.table(JOBS).update({"provider_started": True}).eq("job_id", job_id).execute()
@@ -244,12 +248,14 @@ def run_job(job_id: str) -> None:
                 return
             supabase.table(JOBS).update({"steps_done": i + 1}).eq("job_id", job_id).execute()
 
-        done = supabase.table(JOBS).update({
-            "status": "succeeded", "image_id": result["id"], "steps_done": len(steps),
-            "finished_at": _iso(), "lease_until": None,
-        }).eq("job_id", job_id).eq("status", "running").execute().data
-        logger.info("render job %s %s in %.1fs", job_id, "succeeded" if done else "finished after cancel",
-                    time.time() - t0)
+        from pipelines.render_jobs_pipeline import period_now
+        res = supabase.rpc("finish_render_job", {"p_job": job_id, "p_image": result["id"],
+                                                 "p_period": period_now()}).execute()
+        charged = res.data[0] if isinstance(res.data, list) else res.data
+        if charged is not None and int(charged) >= 0:
+            logger.info("render job %s succeeded in %.1fs, charged %s", job_id, time.time() - t0, charged)
+        else:
+            logger.info("render job %s finished after cancel in %.1fs (not charged)", job_id, time.time() - t0)
     except _Stop:
         pass
     except Exception as exc:

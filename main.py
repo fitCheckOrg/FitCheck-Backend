@@ -58,7 +58,9 @@ async def fitcheck_exception_handler(request, exc):
             "success": False,
             "error": {
                 "code": exc.code,
-                "message": exc.message
+                "message": exc.message,
+                # extra fields some errors carry, e.g. QUOTA_EXCEEDED {used, limit, resets_at}
+                **(getattr(exc, "details", None) or {})
             }
         },
         headers=getattr(exc, "headers", None)

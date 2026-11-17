@@ -5,6 +5,7 @@ POST /api/tryon/jobs                 {outfit_id} | {items}    -> 202 new job / 2
 GET  /api/tryon/jobs/{job_id}        -> job
 GET  /api/tryon/jobs?active=true     -> {items: [job]}   (queued + running: recovery after a restart)
 POST /api/tryon/jobs/{job_id}/cancel -> job
+GET  /api/tryon/usage                -> {period, used, reserved, limit, remaining, resets_at, tier}   (B3)
 
 job = {job_id, outfit_id, status queued|running|succeeded|failed|cancelled,
        progress {step, steps}, queue_position (queued only, 1 = next),
@@ -18,16 +19,25 @@ Create decides, in order (design doc section 2):
     2. the same render is already queued / running for me   -> 200, THAT job
     3. otherwise                                            -> 202, a queued job
 The render itself happens in the background worker (pipelines/render_worker.py).
-Quotas / ceiling come in B3, push in B4.
+
+B3 (2026-11-17) - quotas, limits, ceiling (all numbers are .env settings):
+    RENDER_CREATES_PER_HOUR  30   job creates per user per hour, cache hits included -> 429 RATE_LIMITED
+    MAX_ACTIVE_PER_USER       2   queued + running per user                           -> 429 RATE_LIMITED
+    FREE_RENDER_LIMIT        10   charged generations per UTC calendar month           -> 429 QUOTA_EXCEEDED
+    PREMIUM_RENDER_LIMIT    100   same, tier premium / pro / enterprise
+    RENDER_DAILY_CEILING    100   generations sent to the provider per UTC day, all users -> 503 RENDERS_PAUSED
+  Order: hourly limit -> already rendered (free, opens even when paused / out of renders)
+         -> same render on its way -> active / quota / ceiling (one locked DB step).
+  "used" = charged generations this month; "reserved" = renders still expected by my
+  queued / running jobs. A job is charged only when it SUCCEEDS (finish_render_job).
 """
 
 import hashlib
 import json
 import logging
-from datetime import datetime, timezone
+import os
+from datetime import datetime, timedelta, timezone
 from uuid import UUID
-
-from postgrest.exceptions import APIError
 
 from core.storage.supabase_client import supabase
 from shared.exceptions import FitCheckException, AvatarNotFoundError
@@ -40,11 +50,82 @@ MAX_ACTIVE_PER_USER = 2
 ACTIVE = ("queued", "running")
 JOB_FIELDS = ("job_id, user_id, outfit_id, avatar_id, avatar_version, steps, rendered_slots, tray_slots, "
               "status, failure_code, failure_message, steps_total, steps_done, image_id, "
-              "charged_generations, provider_started, created_at, finished_at")
+              "charged_generations, provider_started, needs, created_at, finished_at")
 
 
-def _bad(code: str, message: str, status: int = 400, headers: dict | None = None) -> FitCheckException:
-    return FitCheckException(message, code=code, status_code=status, headers=headers)
+PREMIUM_TIERS = {"premium", "pro", "enterprise"}
+
+
+def _setting(name: str, default: int) -> int:
+    try:
+        return int(os.getenv(name) or default)
+    except ValueError:
+        return default
+
+
+def _bad(code: str, message: str, status: int = 400, headers: dict | None = None,
+         details: dict | None = None) -> FitCheckException:
+    exc = FitCheckException(message, code=code, status_code=status, headers=headers)
+    exc.details = details or {}                 # extra fields in the error body (main.py)
+    return exc
+
+
+# ---------------------------------------------------------------- B3 period / limits
+
+def period_now() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m")
+
+
+def _resets_at() -> datetime:
+    now = datetime.now(timezone.utc)
+    year, month = (now.year + 1, 1) if now.month == 12 else (now.year, now.month + 1)
+    return datetime(year, month, 1, tzinfo=timezone.utc)
+
+
+def _seconds_to_midnight_utc() -> int:
+    now = datetime.now(timezone.utc)
+    midnight = (now + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+    return max(60, int((midnight - now).total_seconds()))
+
+
+def _tier(uid: str) -> str:
+    rows = supabase.table("profiles").select("tier").eq("id", uid).limit(1).execute().data
+    return str((rows[0].get("tier") if rows else None) or "free").lower()
+
+
+def _limit_for(tier: str) -> int:
+    return _setting("PREMIUM_RENDER_LIMIT", 100) if tier in PREMIUM_TIERS \
+        else _setting("FREE_RENDER_LIMIT", 10)
+
+
+def get_usage(user_id) -> dict:
+    uid = str(user_id)
+    tier = _tier(uid)
+    limit = _limit_for(tier)
+    period = period_now()
+    used = supabase.table("render_charges").select("render_id", count="exact")\
+        .eq("user_id", uid).eq("period", period).limit(1).execute().count or 0
+    active = supabase.table(TABLE).select("needs").eq("user_id", uid)\
+        .in_("status", list(ACTIVE)).execute().data or []
+    reserved = sum(int(r.get("needs") or 0) for r in active)
+    return {"period": period, "used": used, "reserved": reserved, "limit": limit,
+            "remaining": max(0, limit - used - reserved),
+            "resets_at": _resets_at().isoformat(), "tier": tier}
+
+
+def _check_hourly(uid: str) -> None:
+    per_hour = _setting("RENDER_CREATES_PER_HOUR", 30)
+    since = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()
+    made = supabase.table(TABLE).select("job_id", count="exact").eq("user_id", uid)\
+        .gte("created_at", since).limit(1).execute().count or 0
+    if made >= per_hour:
+        raise _bad("RATE_LIMITED", "You've asked for a lot of renders this hour. Try again a bit later.",
+                   429, {"Retry-After": "600"}, {"retry_after": 600})
+    day = supabase.table(TABLE).select("job_id", count="exact").eq("user_id", uid)\
+        .gte("created_at", (datetime.now(timezone.utc) - timedelta(days=1)).isoformat())\
+        .limit(1).execute().count or 0
+    if day > 50:
+        logger.warning("render abuse signal: user=%s created %s jobs in 24 h", uid, day)
 
 
 def _now() -> str:
@@ -135,6 +216,7 @@ def create_job(user_id, outfit_id=None, items=None) -> tuple[dict, bool]:
     from pipelines.tryon_outfits_pipeline import create_outfit
     from pipelines.tryon_pipeline import _find_row
     uid = str(user_id)
+    _check_hourly(uid)                                  # B3: counts cache hits too
     if outfit_id is None:
         if not items:
             raise _bad("OUTFIT_EMPTY", "Send an outfit_id or the pieces to render.")
@@ -158,8 +240,10 @@ def create_job(user_id, outfit_id=None, items=None) -> tuple[dict, bool]:
     }
 
     # 1. Already rendered -> a finished job at once, nothing charged, no provider call.
-    final = _find_row(keys[-1])
-    if final and final.get("status") == "completed" and final.get("s3_key"):
+    rows = [_find_row(k) for k in keys]
+    done = [bool(r and r.get("status") == "completed" and r.get("s3_key")) for r in rows]
+    final = rows[-1]
+    if done[-1]:
         row = supabase.table(TABLE).insert({
             **base, "status": "succeeded", "steps_done": len(steps), "image_id": final["id"],
             "started_at": _now(), "finished_at": _now(),
@@ -167,29 +251,41 @@ def create_job(user_id, outfit_id=None, items=None) -> tuple[dict, bool]:
         logger.info("render job %s cached user=%s", row["job_id"], uid)
         return _shape(row), False
 
-    # 2. Same render already on its way -> that job.
-    existing = supabase.table(TABLE).select(JOB_FIELDS).eq("user_id", uid)\
-        .eq("signature", signature).in_("status", list(ACTIVE)).limit(1).execute().data
-    if existing:
-        return _shape(existing[0]), False
-
-    # 3. New job (limits: B2 keeps 2 active per user; quotas / ceiling are B3).
-    active = supabase.table(TABLE).select("job_id", count="exact").eq("user_id", uid)\
-        .in_("status", list(ACTIVE)).limit(1).execute().count or 0
-    if active >= MAX_ACTIVE_PER_USER:
+    # 2 + 3. Same render on its way -> that job; otherwise admit (active jobs, monthly
+    # quota, daily ceiling) and create - one locked step in the database (B3).
+    needs = len(keys) - (1 if len(keys) == 2 and done[0] else 0)
+    tier = _tier(uid)
+    limit = _limit_for(tier)
+    res = supabase.rpc("create_render_job", {
+        "p_user": uid,
+        "p_job": {k: base[k] for k in ("outfit_id", "avatar_id", "avatar_version", "signature",
+                                       "steps", "rendered_slots", "tray_slots", "steps_total")},
+        "p_needs": needs, "p_limit": limit, "p_period": period_now(),
+        "p_max_active": MAX_ACTIVE_PER_USER, "p_ceiling": _setting("RENDER_DAILY_CEILING", 100),
+    }).execute()
+    out = res.data[0] if isinstance(res.data, list) else res.data
+    if not out.get("ok"):
+        code = out.get("code")
+        if code == "QUOTA_EXCEEDED":
+            resets = _resets_at().isoformat()
+            used, reserved = int(out.get("used") or 0), int(out.get("reserved") or 0)
+            raise _bad("QUOTA_EXCEEDED",
+                       f"This needs {needs} render{'s' if needs != 1 else ''} and you have "
+                       f"{max(0, limit - used - reserved)} left this month.", 429,
+                       details={"used": used, "reserved": reserved, "limit": limit,
+                                "needed": needs, "resets_at": resets})
+        if code == "RENDERS_PAUSED":
+            wait = _seconds_to_midnight_utc()
+            logger.warning("render ceiling reached - new renders paused (user=%s)", uid)
+            raise _bad("RENDERS_PAUSED", "Try-on is very busy today. Your saved and earlier looks "
+                       "still open; new renders are back tomorrow.", 503,
+                       {"Retry-After": str(wait)}, {"retry_after": wait})
         raise _bad("RATE_LIMITED", "You already have renders on the way. Wait for one to finish.",
-                   429, {"Retry-After": "20"})
-    try:
-        row = supabase.table(TABLE).insert({**base, "status": "queued"}).execute().data[0]
-    except APIError as exc:
-        if getattr(exc, "code", None) == "23505":      # a parallel tap made it first
-            existing = supabase.table(TABLE).select(JOB_FIELDS).eq("user_id", uid)\
-                .eq("signature", signature).in_("status", list(ACTIVE)).limit(1).execute().data
-            if existing:
-                return _shape(existing[0]), False
-        raise
-    logger.info("render job %s queued user=%s steps=%s", row["job_id"], uid, len(steps))
-    return _shape(row), True
+                   429, {"Retry-After": "20"}, {"retry_after": 20})
+    job = _get_row(uid, out["job_id"])
+    if out.get("created"):
+        logger.info("render job %s queued user=%s steps=%s needs=%s", out["job_id"], uid, len(steps), needs)
+    return _shape(job), bool(out.get("created"))
 
 
 # ---------------------------------------------------------------- read / cancel
