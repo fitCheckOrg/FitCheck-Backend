@@ -16,10 +16,17 @@ from core.constants.wardrobe_select import WARDROBE_ITEM_SELECT
 
 from shared.models.garment_asset import GarmentAsset
 from workers.wardrobe.asset_builder import build_garment_asset
+from pipelines.tryon_slots import slot_for_category
 
 logger = get_logger(__name__)
 
 router = APIRouter(prefix="/wardrobe", tags=["Wardrobe"])
+
+
+def _with_slot(item: dict) -> dict:
+    """Try-On v2 T2-1 B1: every item says which try-on slot it goes in (or null)."""
+    item["tryon_slot"] = slot_for_category(item.get("category"))
+    return item
 
 
 class UpdateClothingItemRequest(BaseModel):
@@ -77,7 +84,7 @@ async def upload_clothing_item(
     """Upload and process a clothing item"""
     logger.info(f"Wardrobe upload user={user_id}")
     item = await run_wardrobe_pipeline(file=file, user_id=str(user_id))
-    return SuccessResponse(data=item.model_dump())
+    return SuccessResponse(data=_with_slot(item.model_dump()))
 
 
 @router.get("/", response_model=SuccessResponse)
@@ -136,7 +143,7 @@ async def get_wardrobe(
 
     result = query.execute()
     total = result.count or 0
-    items = [ClothingItem(**row).model_dump(mode="json") for row in result.data]
+    items = [_with_slot(ClothingItem(**row).model_dump(mode="json")) for row in result.data]
     return SuccessResponse(data={
         "items": items,
         "pagination": {
@@ -165,7 +172,7 @@ async def get_wardrobe_item(item_id: UUID, user_id: UUID = Depends(get_current_u
     row = dict(result.data)
     image_hash = row.pop("image_hash", None)
     item = ClothingItem(**row)
-    item_dict = item.model_dump(mode="json")
+    item_dict = _with_slot(item.model_dump(mode="json"))
     item_dict["asset_revision"] = f"md5:{image_hash}" if image_hash else None
     return SuccessResponse(data=item_dict)
 
@@ -195,7 +202,7 @@ async def update_wardrobe_item(
     if not result.data:
         raise ClothingItemNotFoundError()
 
-    item = ClothingItem(**result.data[0]).model_dump(mode="json")
+    item = _with_slot(ClothingItem(**result.data[0]).model_dump(mode="json"))
     return SuccessResponse(data=item)
 
 

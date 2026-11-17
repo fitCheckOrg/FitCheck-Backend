@@ -18,18 +18,30 @@ POST   /api/tryon/looks                 {"garment_ids", "tryon_key", "name"?}  2
 GET    /api/tryon/looks?limit&offset    newest first
 PATCH  /api/tryon/looks/{look_id}       {"name": "..." | null}
 DELETE /api/tryon/looks/{look_id}
+
+Try-On v2 T2-1 B1 (2026-11-17):
+GET  /api/tryon/slots                  -> {slots: [{slot, renders, max, excludes, tray_when, categories}],
+                                           render_order}
+POST /api/tryon/outfits  {items: [{garment_id, slot?, fit?}]}  -> outfit (same content -> same id)
+GET  /api/tryon/outfits/{outfit_id}    -> outfit
+  outfit = {outfit_id, items: [{slot, position, garment_id, fit, renders, missing}],
+            rendered_slots, tray_slots, needs_generations, cached_image, created_at}
+  400 OUTFIT_EMPTY | SLOT_INVALID | SLOT_CONFLICT | FIT_INVALID
+  404 OUTFIT_NOT_FOUND | CLOTHING_ITEM_NOT_FOUND
 """
 
 import logging
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, Response
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from shared.dependencies import get_current_user_id
 from shared.models.responses import SuccessResponse
 from pipelines.tryon_pipeline import run_tryon_pipeline, run_outfit_tryon_pipeline
 from pipelines.tryon_looks_pipeline import save_look, list_looks, delete_look, rename_look
+from pipelines.tryon_slots import slots_payload
+from pipelines.tryon_outfits_pipeline import create_outfit, get_outfit
 
 logger = logging.getLogger(__name__)
 
@@ -57,9 +69,37 @@ class RenameLookRequest(BaseModel):
     name: str | None = None
 
 
+class OutfitItem(BaseModel):                       # T2-1 B1
+    garment_id: UUID
+    slot: str | None = Field(default=None, max_length=20)
+    fit: dict | None = None
+
+
+class CreateOutfitRequest(BaseModel):
+    items: list[OutfitItem] = Field(default_factory=list, max_length=20)
+
+
 @router.get("/health")
 async def health():
-    return {"service": "tryon", "version": "2.2.0", "status": "healthy"}
+    return {"service": "tryon", "version": "2.3.0", "status": "healthy"}
+
+
+# ---------------------------------------------------------------- T2-1 B1: slots + outfits
+
+@router.get("/slots")
+async def get_slots(user_id: UUID = Depends(get_current_user_id)):
+    return SuccessResponse(data=slots_payload())
+
+
+@router.post("/outfits")
+def post_outfit(body: CreateOutfitRequest, user_id: UUID = Depends(get_current_user_id)):
+    items = [{"garment_id": i.garment_id, "slot": i.slot, "fit": i.fit} for i in body.items]
+    return SuccessResponse(data=create_outfit(user_id, items))
+
+
+@router.get("/outfits/{outfit_id}")
+def read_outfit(outfit_id: UUID, user_id: UUID = Depends(get_current_user_id)):
+    return SuccessResponse(data=get_outfit(user_id, outfit_id))
 
 
 @router.post("")
