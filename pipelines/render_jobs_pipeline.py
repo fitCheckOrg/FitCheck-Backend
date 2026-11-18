@@ -13,6 +13,9 @@ job = {job_id, outfit_id, status queued|running|succeeded|failed|cancelled,
        failure {code, message} | null, image (image object) | null,
        created_at, finished_at}
 
+B6 (2026-11-18): a job's image carries outdated ("garment_deleted" | "avatar_replaced")
+and url null when the file was deleted.
+
 Create decides, in order (design doc section 2):
     1. the finished render of exactly these pieces exists  -> 200, a job already 'succeeded',
        charged 0, no provider call
@@ -152,7 +155,7 @@ def _shape(job: dict) -> dict:
     from pipelines.tryon_outfits_pipeline import _image
     image = None
     if job.get("image_id"):
-        rows = supabase.table("tryon_renders").select("id, s3_key, status")\
+        rows = supabase.table("tryon_renders").select("id, s3_key, status, outdated, file_deleted_at")\
             .eq("id", str(job["image_id"])).limit(1).execute().data
         if rows and rows[0].get("s3_key"):
             image = _image(rows[0], {"avatar_version": job["avatar_version"]},

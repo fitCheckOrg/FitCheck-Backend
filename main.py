@@ -31,6 +31,7 @@ from api.media import router as media_router
 from core.storage.sign_middleware import SignPrivateLinks
 from pipelines.push_pipeline import push_worker
 from pipelines.render_worker import render_worker
+from pipelines.outdated_pipeline import cleanup_worker
 import asyncio
 
 
@@ -50,6 +51,11 @@ async def start_push_worker():
 @app.on_event("startup")
 async def start_render_worker():
     asyncio.create_task(render_worker())
+
+# Try-On v2 T2-1 B6: background loop that retries failed deletes of outdated render files.
+@app.on_event("startup")
+async def start_cleanup_worker():
+    asyncio.create_task(cleanup_worker())
 
 # Global exception handler - no try/except in routes
 @app.exception_handler(FitCheckException)

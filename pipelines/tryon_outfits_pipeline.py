@@ -94,11 +94,14 @@ def _plan(items: list[dict]) -> tuple[list[dict], list[str], list[str]]:
 
 
 def _image(row: dict, avatar: dict, garment_ids: list[str]) -> dict:
-    """Image object. B5: url is a signed link until expires_at (re-sign: POST /api/media/sign)."""
+    """Image object. B5: url is a signed link until expires_at (re-sign: POST /api/media/sign).
+    B6: outdated = "garment_deleted" | "avatar_replaced" | null; url null when the file is gone."""
     signed = storage.signed(row["s3_key"])
-    return {"image_id": str(row["id"]), "key": signed["key"], "url": signed["url"],
-            "expires_at": signed["expires_at"], "avatar_version": avatar["avatar_version"],
-            "garment_ids": garment_ids, "outdated": None}
+    gone = bool(row.get("file_deleted_at"))
+    return {"image_id": str(row["id"]), "key": signed["key"],
+            "url": None if gone else signed["url"], "expires_at": None if gone else signed["expires_at"],
+            "avatar_version": avatar["avatar_version"], "garment_ids": garment_ids,
+            "outdated": row.get("outdated")}
 
 
 def _cost(uid: str, rendered: list[dict]) -> tuple[int | None, dict | None]:

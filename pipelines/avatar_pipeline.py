@@ -140,6 +140,12 @@ async def run_avatar_pipeline(
         # 11. Delete old S3 images after successful save
         _cleanup_old_images(old_original_url, old_processed_url)
 
+        # 12. Try-On v2 B6: renders of the old avatar are outdated; their files are
+        # deleted unless a saved look keeps them. Never fails the upload.
+        if profile.avatar_version > 1:
+            from pipelines.outdated_pipeline import outdate_avatar
+            outdate_avatar(user_id, profile.avatar_version)
+
         logger.info(
             "Avatar pipeline complete - user=%s version=%d shape=%s",
             user_id,

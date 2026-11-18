@@ -9,6 +9,7 @@ from shared.models.enums import Category
 from shared.exceptions import ClothingItemNotFoundError
 from core.storage.supabase_client import supabase
 from core.storage.s3 import storage
+from pipelines.outdated_pipeline import outdate_garment
 from pipelines.wardrobe_pipeline import run_wardrobe_pipeline
 from shared.dependencies import get_current_user_id
 from shared.models.clothing import ClothingItem
@@ -239,6 +240,10 @@ async def delete_wardrobe_item(item_id: UUID, user_id: UUID = Depends(get_curren
         .eq("item_id", str(item_id))\
         .eq("user_id", str(user_id))\
         .execute()
+
+    # Try-On v2 B6: renders showing this piece are outdated; their files are
+    # deleted unless a saved look keeps them. Never fails the delete.
+    outdate_garment(user_id, item_id)
 
     return SuccessResponse(data={"message": "Item deleted successfully"})
 

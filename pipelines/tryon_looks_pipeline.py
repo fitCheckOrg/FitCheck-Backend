@@ -14,6 +14,8 @@ Try-On v2 T2-1 B5 (2026-11-18): every look carries the image object
 (url is a signed link for 1 hour; re-sign with POST /api/media/sign). image_url
 stays (same signed link) and tryon_key stays until the app has switched.
 image_id is the render's id (tryon_looks.render_id, set on save).
+B6 (2026-11-18): outdated = "garment_deleted" | "avatar_replaced" | null. A look
+always keeps its image file, even when outdated.
 
 Integrity checks on save:
     * tryon_key must be a COMPLETED render in tryon_renders owned by this user
@@ -51,7 +53,7 @@ def _to_look(row: dict) -> dict:
         "image_url": signed["url"],
         "image": {"image_id": str(row["render_id"]) if row.get("render_id") else None,
                   "key": signed["key"], "url": signed["url"], "expires_at": signed["expires_at"],
-                  "outdated": None},
+                  "outdated": row.get("outdated")},
         "name": row.get("name"),
         "created_at": row["created_at"],
     }
