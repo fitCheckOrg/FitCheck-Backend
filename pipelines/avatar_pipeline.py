@@ -10,7 +10,6 @@ from workers.avatar.analyzer import analyze_body
 from workers.avatar.generator import build_avatar_profile
 from workers.avatar.saver import save_avatar
 from workers.avatar.pose_estimator import estimate_pose
-from tryon.underarm_upload_check import check_avatar_photo
 
 logger = get_logger(__name__)
 
@@ -22,8 +21,11 @@ async def run_avatar_pipeline(
     """
     Full avatar processing pipeline.
 
-    Validate -> Remove BG -> Enhance -> Analyze -> Pose -> Underarm check ->
-    Upload Images -> Build Profile -> Save -> Cleanup old
+    Validate -> Remove BG -> Enhance -> Analyze -> Pose ->
+    Upload Images -> Build Profile -> Save -> Cleanup old -> Outdate old renders
+
+    Try-On v2 B7 (2026-11-18): the underarm check (old mesh try-on) is gone -
+    FASHN needs no landmarks, and it cost ~11 s per upload.
 
     One avatar per user - upserts on conflict.
     Rollback: deletes new S3 images if save fails.
@@ -89,15 +91,6 @@ async def run_avatar_pipeline(
         else:
             logger.warning("Step 4b/7 - Pose keypoints not detected, continuing without them")
 
-        # 4c. Underarm check on the FINAL processed photo and its keypoints,
-        # BEFORE any S3 upload: a photo that needs retaking costs nothing to
-        # reject (nothing to roll back) and the user's existing avatar is
-        # untouched (the save is the last step). Mode comes from
-        # UNDERARM_GATE_MODE: off | shadow (default, logs only) | enforce
-        # (raises 422 UNDERARM_NOT_DETECTED). The check fails open: if it
-        # cannot run, the upload proceeds.
-        check_avatar_photo(enhanced_bytes, pose_keypoints, user_id=user_id)
-
         # 7. Upload original to S3
         original_result = storage.upload(
             image_bytes,
@@ -156,11 +149,7 @@ async def run_avatar_pipeline(
         return saved_avatar
 
     except Exception as e:
-        if getattr(e, "code", None) == "UNDERARM_NOT_DETECTED":
-            # Expected outcome (the photo needs retaking), not a pipeline crash.
-            logger.warning("Avatar pipeline stopped - photo needs retaking - user=%s", user_id)
-        else:
-            logger.exception("Avatar pipeline failed")
+        logger.exception("Avatar pipeline failed")
         _rollback(original_key, processed_key)
         raise
 

@@ -1,4 +1,4 @@
-from fastapi import APIRouter, UploadFile, File, Form, Query, Depends
+from fastapi import APIRouter, UploadFile, File, Depends
 from pydantic import BaseModel
 from uuid import UUID
 from starlette.concurrency import run_in_threadpool
@@ -6,12 +6,9 @@ from shared.logger import get_logger
 from shared.models.responses import SuccessResponse
 from shared.exceptions import AvatarNotFoundError
 from core.storage.supabase_client import supabase
-from core.storage.s3 import storage
 from pipelines.avatar_pipeline import run_avatar_pipeline
 from pipelines.avatar_delete_pipeline import delete_avatar_everything
 from shared.dependencies import get_current_user_id
-from shared.models.avatar_asset import AvatarAsset
-from workers.avatar.asset_builder import build_avatar_asset
 
 
 logger = get_logger(__name__)
@@ -20,16 +17,21 @@ router = APIRouter(prefix="/avatar", tags=["Avatar"])
 
 
 class UpdateAvatarRequest(BaseModel):
+    """Editable avatar fields.
+
+    Try-On v2 B7 (P8): display_body_shape / display_skin_tone were accepted here
+    but those columns don't exist, so sending them gave a 500. They're gone;
+    an old client that still sends them is simply ignored (unknown fields are
+    dropped), never an error.
+    """
     display_height: str | None = None
-    display_body_shape: str | None = None
-    display_skin_tone: str | None = None
     hair_style: str | None = None
     hair_color: str | None = None
 
 
 @router.get("/health")
 async def health():
-    return { "service": "avatar", "version": "1.1.0", "status": "healthy" }
+    return { "service": "avatar", "version": "1.2.0", "status": "healthy" }
 
 
 @router.post("/upload", response_model=SuccessResponse)
@@ -89,9 +91,3 @@ async def delete_avatar(user_id: UUID = Depends(get_current_user_id)):
     logger.info(f"Delete avatar - user={user_id}")
     result = await run_in_threadpool(delete_avatar_everything, str(user_id))
     return SuccessResponse(data=result)
-
-@router.get("/asset")
-async def get_avatar_asset(user_id: UUID = Depends(get_current_user_id)):
-    logger.info(f"Get avatar asset - user={user_id}")
-    asset = build_avatar_asset(str(user_id))
-    return SuccessResponse(data=asset)
