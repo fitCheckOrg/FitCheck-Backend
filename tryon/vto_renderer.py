@@ -1,4 +1,4 @@
-"""
+﻿"""
 Try-on renderer: the ONLY module in the backend that knows which
 try-on model/provider we use.
 
@@ -10,14 +10,13 @@ worker (pipelines/render_worker.py):
 
     request_id = renderer.submit(person_image, garment_image, category)   # returns at once
     state      = renderer.poll(request_id)    # ("queued", pos) | ("running", None)
-                                              # | ("done", result_url) | ("error", message)
-    png_bytes  = renderer.fetch(result_url)   # download with retries (already paid for)
+                                              # | ("done", result_ref) | ("error", message)
+    png_bytes  = renderer.fetch(result_ref)   # download with retries (already paid for)
     renderer.cancel(request_id)               # best effort
 
 person_image / garment_image can be PIL Images, raw bytes, or http(s) URLs.
-Swapping provider (another fal model, FASHN direct, self-hosted CatVTON)
-means adding a new TryOnRenderer subclass and changing get_renderer().
-Nothing else in the backend, and nothing in Flutter, changes.
+Swapping provider means adding a new TryOnRenderer subclass and changing
+get_renderer(). Nothing else in the backend, and nothing in Flutter, changes.
 
 B-TRY-1 (2026-11-03): every download (input photos and the finished render)
 goes through _get_with_retry, so a short network drop (DNS getaddrinfo
@@ -30,7 +29,17 @@ B5 (2026-11-18): avatar photos and renders are PRIVATE in S3. A link to our own
 bucket is swapped for a fresh signed link before every download attempt, so the
 stored plain URLs (avatars.original_photo_url) keep working after the bucket is locked.
 
-Smoke test (server must be running on :8000):
+B8 (2026-11-20): fal removed FASHN v1.6 ("This endpoint is deprecated and no longer
+available"). The same model now runs on FASHN's own API (https://api.fashn.ai/v1,
+model_name "tryon-v1.6", 1 credit per image, key FASHN_API_KEY in .env).
+  * Inputs are sent as base64 and the output comes back as base64 (return_base64):
+    FASHN keeps it 60 minutes, never on its CDN, and doesn't train on it.
+  * poll() returns "fashn:<id>" instead of a URL; fetch() reads the image from the
+    status endpoint (valid 60 min) with retries, so a finished render is never paid twice.
+  * FASHN has no cancel endpoint: cancel() only logs (the render finishes and is cached).
+  * name stays "fal-fashn-v1.6": same model, so existing cached renders keep matching.
+
+Smoke test (server must be running on :8000; costs 1 FASHN credit):
     python -m tryon.vto_renderer
 """
 
@@ -57,6 +66,13 @@ DOWNLOAD_TIMEOUT = 30          # seconds per attempt
 RETRY_WAITS = (2, 4, 8)        # seconds to wait before retry 1, 2, 3
 PERSON_MAX_SIDE = 1536         # px, longest side of the person photo sent to the model
 
+FASHN_API = "https://api.fashn.ai/v1"
+FASHN_SUBMIT_TIMEOUT = 60      # seconds (the request carries both images)
+FASHN_STATUS_TIMEOUT = 30      # seconds
+RESULT_PREFIX = "fashn:"       # poll() -> "fashn:<id>"; fetch() reads it from /status
+RENDER_TIMEOUT = 180           # seconds, blocking render() only
+POLL_EVERY = 2                 # seconds, blocking render() only
+
 
 class TryOnRenderError(Exception):
     """Provider failed, was rejected, or returned no image."""
@@ -65,7 +81,8 @@ class TryOnRenderError(Exception):
 # ---------------------------------------------------------------- helpers
 
 def _ensure_fal_key():
-    """Make sure FAL_KEY is in the environment, falling back to reading .env."""
+    """Make sure FAL_KEY is in the environment, falling back to reading .env.
+    (No longer used by the try-on renderer; kept for the T2-2 prototypes.)"""
     if os.environ.get("FAL_KEY"):
         return
     env = Path(".env")
@@ -76,6 +93,35 @@ def _ensure_fal_key():
                 os.environ["FAL_KEY"] = line.split("=", 1)[1].strip().strip('"').strip("'")
                 return
     raise TryOnRenderError("FAL_KEY is not set (checked environment and .env)")
+
+
+def _fashn_key() -> str:
+    """FASHN_API_KEY from the environment, falling back to reading .env."""
+    key = os.environ.get("FASHN_API_KEY", "").strip()
+    if not key:
+        env = Path(".env")
+        if env.exists():
+            for line in env.read_text(encoding="utf-8", errors="replace").splitlines():
+                line = line.strip()
+                if line.startswith("FASHN_API_KEY="):
+                    key = line.split("=", 1)[1].strip().strip('"').strip("'")
+                    break
+    if not key:
+        raise TryOnRenderError("FASHN_API_KEY is not set (checked environment and .env)")
+    os.environ["FASHN_API_KEY"] = key
+    return key
+
+
+def _fashn_error(body) -> str:
+    """FASHN errors are {"error": "Name", "message": "..."} or {"error": {"name", "message"}}."""
+    if not isinstance(body, dict):
+        return str(body)[:300]
+    err = body.get("error")
+    if isinstance(err, dict):
+        return f"{err.get('name') or 'error'}: {err.get('message') or ''}".rstrip(": ")
+    if err:
+        return f"{err}: {body.get('message') or ''}".rstrip(": ")
+    return str(body)[:300]
 
 
 def _get_with_retry(url: str, what: str) -> bytes:
@@ -150,6 +196,15 @@ def _data_uri(img: Image.Image, fmt: str) -> str:
     return f"data:{mime};base64,{base64.b64encode(buf.getvalue()).decode('ascii')}"
 
 
+def _decode_output(out: str) -> bytes:
+    """A FASHN output: a data URI / plain base64 (return_base64) or, defensively, a URL."""
+    if out.startswith("data:"):
+        return base64.b64decode(out.split(",", 1)[1])
+    if out.startswith("http"):
+        return _get_with_retry(out, "try-on result")
+    return base64.b64decode(out)
+
+
 # ---------------------------------------------------------------- interface
 
 class TryOnRenderer(ABC):
@@ -180,19 +235,24 @@ class TryOnRenderer(ABC):
         return None
 
 
-# ---------------------------------------------------------------- fal / FASHN
+# ---------------------------------------------------------------- FASHN (own API)
 
-class FalFashnRenderer(TryOnRenderer):
-    """FASHN v1.6 via fal.ai. One sample, fixed seed, quality mode."""
+class FashnApiRenderer(TryOnRenderer):
+    """FASHN v1.6 on FASHN's own API. One sample, fixed seed, quality mode, base64 in/out."""
 
-    ENDPOINT = "fal-ai/fashn/tryon/v1.6"
-    name = "fal-fashn-v1.6"
+    MODEL = "tryon-v1.6"
+    ENDPOINT = f"{FASHN_API}/run ({MODEL})"
+    name = "fal-fashn-v1.6"     # same model as before B8; kept so cached renders keep matching
 
     def __init__(self, seed: int = 42, mode: str = "quality"):
         self.seed = seed
         self.mode = mode
 
-    def _arguments(self, person_image: ImageInput, garment_image: ImageInput, category: str) -> dict:
+    @staticmethod
+    def _headers() -> dict:
+        return {"Authorization": f"Bearer {_fashn_key()}", "Content-Type": "application/json"}
+
+    def _inputs(self, person_image: ImageInput, garment_image: ImageInput, category: str) -> dict:
         if category not in VALID_CATEGORIES:
             raise ValueError(f"category must be one of {sorted(VALID_CATEGORIES)}, got {category!r}")
         person = _shrink(_to_pil(person_image, "person photo").convert("RGB"), PERSON_MAX_SIDE)
@@ -206,83 +266,118 @@ class FalFashnRenderer(TryOnRenderer):
             "num_samples": 1,
             "seed": self.seed,
             "output_format": "png",
+            "return_base64": True,
         }
 
-    @staticmethod
-    def _image_url(result) -> str:
-        images = (result or {}).get("images") or []
-        if not images or not images[0].get("url"):
-            raise TryOnRenderError(f"no image in the result: {result}")
-        return images[0]["url"]
-
-    # -- blocking (old /tryon endpoints)
-
-    def render(self, person_image: ImageInput, garment_image: ImageInput,
-               category: str = "tops") -> bytes:
-        _ensure_fal_key()
-        import fal_client  # imported after FAL_KEY is guaranteed
-
-        arguments = self._arguments(person_image, garment_image, category)
+    def _status(self, request_id: str) -> tuple[int, dict]:
+        r = requests.get(f"{FASHN_API}/status/{request_id}", headers=self._headers(),
+                         timeout=FASHN_STATUS_TIMEOUT)
         try:
-            result = fal_client.subscribe(self.ENDPOINT, arguments=arguments)
-        except Exception as exc:  # fal raises its own HTTP error types
-            raise TryOnRenderError(f"{self.name} request failed: {exc}") from exc
-
-        # The render is already paid for at this point - retry the download
-        # instead of failing and making the user render (and pay) again.
-        return self.fetch(self._image_url(result))
+            return r.status_code, r.json()
+        except ValueError:
+            return r.status_code, {}
 
     # -- steps (background worker)
 
     def submit(self, person_image: ImageInput, garment_image: ImageInput,
                category: str = "tops") -> str:
-        _ensure_fal_key()
-        import fal_client
-
-        arguments = self._arguments(person_image, garment_image, category)
+        body = {"model_name": self.MODEL, "inputs": self._inputs(person_image, garment_image, category)}
         try:
-            handle = fal_client.submit(self.ENDPOINT, arguments=arguments)
-        except Exception as exc:
+            r = requests.post(f"{FASHN_API}/run", json=body, headers=self._headers(),
+                              timeout=FASHN_SUBMIT_TIMEOUT)
+        except requests.RequestException as exc:
             raise TryOnRenderError(f"{self.name} submit failed: {exc}") from exc
-        return handle.request_id
+        try:
+            data = r.json()
+        except ValueError:
+            data = {}
+        if r.status_code != 200 or not data.get("id"):
+            detail = _fashn_error(data) if data else r.text[:300]
+            raise TryOnRenderError(f"{self.name} submit refused ({r.status_code}): {detail}")
+        return data["id"]
 
     def poll(self, request_id: str) -> tuple[str, object]:
-        _ensure_fal_key()
-        import fal_client
-
         try:
-            status = fal_client.status(self.ENDPOINT, request_id)
-        except Exception as exc:
+            code, data = self._status(request_id)
+        except requests.RequestException as exc:
             # A network blip while asking is not a failed render: ask again next time.
             logger.warning("%s status check failed for %s: %s", self.name, request_id, exc)
             return "running", None
-        if isinstance(status, fal_client.Queued):
-            return "queued", status.position
-        if isinstance(status, fal_client.InProgress):
+        except TryOnRenderError as exc:
+            return "error", str(exc)
+        if code == 429 or code >= 500:
+            logger.warning("%s status check for %s got HTTP %s - asking again", self.name, request_id, code)
             return "running", None
-        if isinstance(status, fal_client.Completed):
-            if status.error:
-                return "error", f"{status.error_type or 'error'}: {status.error}"
+        if code != 200:
+            return "error", f"status check refused ({code}): {_fashn_error(data)}"
+        status = data.get("status")
+        if status == "completed":
+            if not (data.get("output") or []):
+                return "error", "no image in the result"
+            return "done", f"{RESULT_PREFIX}{request_id}"
+        if status in ("failed", "canceled", "time_out"):
+            return "error", _fashn_error(data) if data.get("error") else str(status)
+        return "running", None          # starting / in_queue / processing
+
+    def fetch(self, result_url: str) -> bytes:
+        if not result_url.startswith(RESULT_PREFIX):
+            return super().fetch(result_url)
+        request_id = result_url[len(RESULT_PREFIX):]
+        last_error = None
+        for attempt in range(1, DOWNLOAD_ATTEMPTS + 1):
             try:
-                return "done", self._image_url(fal_client.result(self.ENDPOINT, request_id))
-            except Exception as exc:
-                return "error", f"could not read the result: {exc}"
-        return "running", None
+                code, data = self._status(request_id)
+                if code == 200:
+                    out = (data.get("output") or [None])[0]
+                    if data.get("status") != "completed" or not out or "_expired" in str(out)[:20]:
+                        raise TryOnRenderError(
+                            f"result not available ({data.get('status')}); FASHN keeps base64 results 60 min")
+                    if attempt > 1:
+                        logger.info("try-on result read on attempt %d", attempt)
+                    return _decode_output(out)
+                if code < 500 and code != 429:
+                    raise TryOnRenderError(f"could not read the result ({code}): {_fashn_error(data)}")
+                last_error = f"HTTP {code}"
+            except requests.RequestException as exc:
+                last_error = f"{type(exc).__name__}: {exc}"
+
+            if attempt < DOWNLOAD_ATTEMPTS:
+                wait = RETRY_WAITS[min(attempt - 1, len(RETRY_WAITS) - 1)]
+                logger.warning("try-on result read failed (attempt %d/%d): %s - retrying in %ds",
+                               attempt, DOWNLOAD_ATTEMPTS, last_error, wait)
+                time.sleep(wait)
+
+        raise TryOnRenderError(
+            f"could not read the try-on result after {DOWNLOAD_ATTEMPTS} attempts: {last_error}"
+        )
 
     def cancel(self, request_id: str) -> None:
-        try:
-            _ensure_fal_key()
-            import fal_client
-            fal_client.cancel(self.ENDPOINT, request_id)
-        except Exception as exc:
-            logger.info("%s cancel %s: %s", self.name, request_id, exc)
+        # FASHN's API has no cancel endpoint. The render finishes on their side and the
+        # worker caches it (never charged to a user who cancelled).
+        logger.info("%s cancel %s: no cancel endpoint at FASHN - left to finish", self.name, request_id)
+
+    # -- blocking (old /tryon endpoints)
+
+    def render(self, person_image: ImageInput, garment_image: ImageInput,
+               category: str = "tops") -> bytes:
+        request_id = self.submit(person_image, garment_image, category)
+        t0 = time.time()
+        while time.time() - t0 < RENDER_TIMEOUT:
+            time.sleep(POLL_EVERY)
+            state, value = self.poll(request_id)
+            if state == "done":
+                # Already paid for - fetch() retries instead of failing.
+                return self.fetch(value)
+            if state == "error":
+                raise TryOnRenderError(f"{self.name}: {value}")
+        raise TryOnRenderError(f"{self.name}: no result after {RENDER_TIMEOUT}s")
 
 
 # ---------------------------------------------------------------- factory
 
 def get_renderer() -> TryOnRenderer:
     """The one place that decides which provider the backend uses."""
-    return FalFashnRenderer()
+    return FashnApiRenderer()
 
 
 # ---------------------------------------------------------------- smoke test
@@ -290,8 +385,8 @@ def get_renderer() -> TryOnRenderer:
 if __name__ == "__main__":
     import time as _time
 
-    USER = "f4b5f129-db34-40e5-8423-d1b256a15578"
-    GARMENT = "a852b031-a407-49db-9df6-7e22ecac2ea6"
+    USER = "15bacab3-5873-401b-9c9a-52f8b3eeeaf7"          # Keji
+    GARMENT = "d20577a1-01e9-4d6f-87a1-5ca89c3badba"       # black tee
     API = "http://127.0.0.1:8000/api"
 
     def _data(url):
@@ -307,4 +402,4 @@ if __name__ == "__main__":
     out = Path("outputs/vto_spike/renderer_smoke.png")
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_bytes(png)
-    print(f"OK  {renderer.name}  {len(png)//1024} KB  {_time.time()-t0:.1f}s  -> {out}")
+    print(f"OK  {renderer.name} via {renderer.ENDPOINT}  {len(png)//1024} KB  {_time.time()-t0:.1f}s  -> {out}")
