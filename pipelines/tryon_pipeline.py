@@ -1,17 +1,16 @@
 """
-Try-on rendering pipeline - V2 (learned try-on model + render cache).
+Try-on render cache helpers - V2.
 
-Single garment:   run_tryon_pipeline(garment_id, user_id)
-Full outfit:      run_outfit_tryon_pipeline(garment_ids, user_id)
-                  = chained renders: top onto the user's photo, then the
-                  bottom onto THAT result. Each step is cached on its own,
-                  so step 1 is shared with the single-garment try-on.
+Since T2-1 B7b (2026-11-25) all rendering happens in the background worker
+(pipelines/render_worker.py, render jobs). The old blocking routes
+POST /api/tryon and /api/tryon/outfit and their pipeline functions
+(run_tryon_pipeline, run_outfit_tryon_pipeline, _ensure_render,
+_render_and_store) are removed.
 
-    cache lookup in tryon_renders
-        -> completed?           return cached image (no model call)
-        -> someone rendering?   return {"status": "processing"}
-        -> otherwise            claim row, render (fal/FASHN), upload to S3,
-                                mark completed, return image
+What stays here is shared by outfits, jobs and the worker:
+    cache identity (_single_key, _chain_key), cache lookup (_find_row),
+    claiming / failing a cache row (_claim, _mark_failed),
+    loading the avatar / a garment, FASHN category mapping.
 
 Cache identity:
     (avatar_id, avatar_version, garment_id, asset_revision,
@@ -22,6 +21,11 @@ misses the cache and renders fresh. Old rows are simply never matched.
 Chain steps use renderer_version "<v>-chain" and an asset_revision that
 includes the first garment, so they never collide with single renders.
 
+B8 (2026-11-23): the renderer now calls FASHN's own API instead of fal, but it is
+the SAME model, so PROVIDER stays "fal" on purpose: it is part of the cache
+identity, and changing it would make every existing render miss the cache
+(users would pay again for looks they already have).
+
 Rules the table design forces on us:
   * a 'processing' row older than STALE_AFTER is treated as dead
     (server crashed mid-render) and may be re-claimed;
@@ -29,27 +33,22 @@ Rules the table design forces on us:
 """
 
 import logging
-import time
 from datetime import datetime, timedelta, timezone
-from uuid import UUID
 
 from postgrest.exceptions import APIError
-from starlette.concurrency import run_in_threadpool
 
-from core.storage.s3 import storage, S3Folders
 from core.storage.supabase_client import supabase
 from shared.exceptions import (
     FitCheckException,
     AvatarNotFoundError,
     ClothingItemNotFoundError,
 )
-from tryon.vto_renderer import get_renderer, TryOnRenderError
 
 logger = logging.getLogger(__name__)
 
 TABLE = "tryon_renders"
 
-# Must describe what get_renderer() actually returns.
+# Cache identity of what get_renderer() returns (see the B8 note above).
 # Change model/settings in vto_renderer.py  ->  bump RENDERER_VERSION here.
 PROVIDER = "fal"
 MODEL = "fashn-v1.6"
@@ -113,6 +112,8 @@ def _load_garment(garment_id: str, user_id: str) -> dict:
     return res.data
 
 
+# ------------------------------------------------------------------ cache identity
+
 def _single_key(avatar: dict, garment: dict) -> dict:
     return {
         "avatar_id": avatar["avatar_id"],
@@ -147,6 +148,8 @@ def _find_row(key: dict):
     res = q.limit(1).execute()
     return res.data[0] if res.data else None
 
+
+# ------------------------------------------------------------------ claiming a cache row
 
 def _claim(row, key: dict, user_id: str):
     """
@@ -188,166 +191,3 @@ def _mark_failed(row_id: str, message: str):
         }).eq("id", row_id).execute()
     except Exception:
         logger.exception("could not mark try-on render %s as failed", row_id)
-
-
-def _render_and_store(row_id: str, person_url: str, garment_url: str, category: str) -> dict:
-    """Blocking (~15 s). Always called through run_in_threadpool."""
-    t0 = time.time()
-    try:
-        png = get_renderer().render(person_url, garment_url, category)
-        uploaded = storage.upload(
-            png, folder=S3Folders.TRYON, extension="png", content_type="image/png"
-        )
-    except Exception as exc:
-        _mark_failed(row_id, str(exc))
-        if isinstance(exc, TryOnRenderError):
-            raise FitCheckException(
-                "Try-on rendering failed.", code="TRYON_RENDER_ERROR", status_code=502
-            ) from exc
-        raise
-
-    now = _now_iso()
-    try:
-        supabase.table(TABLE).update({
-            "status": "completed",
-            "s3_key": uploaded["key"],
-            "error_message": None,
-            "updated_at": now,
-            "completed_at": now,
-        }).eq("id", row_id).execute()
-    except Exception:
-        # Image exists but the row didn't update. It goes stale after
-        # STALE_AFTER and gets re-rendered; the user still gets this image now.
-        logger.exception("render %s uploaded but cache row not marked completed", row_id)
-
-    logger.info("try-on rendered row=%s key=%s %.1fs", row_id, uploaded["key"], time.time() - t0)
-    return {"status": "completed", "url": uploaded["url"], "key": uploaded["key"], "cached": False}
-
-
-async def _ensure_render(user_id: str, key: dict, person_url: str,
-                         garment_url: str, category: str) -> dict:
-    """Cached image for this key, or render it now, or report 'processing'."""
-    row = _find_row(key)
-    if row and row["status"] == "completed" and row.get("s3_key"):
-        return {
-            "status": "completed",
-            "url": storage.get_url(row["s3_key"]),
-            "key": row["s3_key"],
-            "cached": True,
-        }
-
-    row_id = _claim(row, key, user_id)
-    if row_id is None:
-        return {"status": "processing"}
-
-    return await run_in_threadpool(_render_and_store, row_id, person_url, garment_url, category)
-
-
-def _wrap_unexpected(exc: Exception, user_id: str, what: str) -> FitCheckException:
-    logger.exception("Try-on pipeline failed - user=%s %s", user_id, what)
-    return FitCheckException(
-        "Try-on rendering failed.",
-        code="TRYON_RENDER_ERROR",
-        status_code=500,
-    )
-
-
-# ------------------------------------------------------------------ single garment
-
-async def run_tryon_pipeline(garment_id: UUID, user_id: UUID) -> dict:
-    """
-    Returns one of:
-        {"status": "completed", "url", "key", "cached": bool}
-        {"status": "processing"}      -> route answers 202, client retries
-    """
-    uid, gid = str(user_id), str(garment_id)
-    try:
-        avatar = _load_avatar(uid)
-        garment = _load_garment(gid, uid)
-        category = _fashn_category(garment["category"])
-
-        result = await _ensure_render(
-            uid, _single_key(avatar, garment),
-            avatar["original_photo_url"], garment["clean_image_url"], category,
-        )
-        logger.info("try-on %s user=%s garment=%s category=%s",
-                    "cache hit" if result.get("cached") else result["status"], uid, gid, category)
-        return result
-
-    except FitCheckException:
-        raise
-    except Exception as exc:
-        raise _wrap_unexpected(exc, uid, f"garment={gid}") from exc
-
-
-# ------------------------------------------------------------------ full outfit (chained)
-
-def _outfit_unsupported(message: str) -> FitCheckException:
-    return FitCheckException(message, code="TRYON_OUTFIT_UNSUPPORTED", status_code=400)
-
-
-async def run_outfit_tryon_pipeline(garment_ids: list[UUID], user_id: UUID) -> dict:
-    """
-    One top + one bottom -> chained render. A single garment (incl. a dress)
-    behaves exactly like run_tryon_pipeline.
-
-    Returns one of:
-        {"status": "completed", "url", "key", "cached", "steps": [{garment_id, key}, ...]}
-        {"status": "processing", "step": 1 | 2}
-    """
-    uid = str(user_id)
-    ids = list(dict.fromkeys(str(g) for g in garment_ids))
-    if not ids:
-        raise _outfit_unsupported("Pick at least one item to try on.")
-    if len(ids) > 2:
-        raise _outfit_unsupported("Outfit try-on supports one top and one bottom for now.")
-
-    try:
-        avatar = _load_avatar(uid)
-        garments = [_load_garment(g, uid) for g in ids]
-        cats = [_fashn_category(g["category"]) for g in garments]  # 409 for shoes etc.
-
-        if len(garments) == 2:
-            if sorted(cats) != ["bottoms", "tops"]:
-                raise _outfit_unsupported(
-                    "Outfit try-on needs one top and one bottom. Dresses are tried on alone."
-                )
-            if cats[0] == "bottoms":            # always render the top first
-                garments.reverse()
-                cats.reverse()
-
-        first = garments[0]
-        step1 = await _ensure_render(
-            uid, _single_key(avatar, first),
-            avatar["original_photo_url"], first["clean_image_url"], cats[0],
-        )
-        if step1["status"] != "completed":
-            return {"status": "processing", "step": 1}
-
-        steps = [{"garment_id": str(first["item_id"]), "key": step1["key"]}]
-        if len(garments) == 1:
-            return {**step1, "steps": steps}
-
-        second = garments[1]
-        step2 = await _ensure_render(
-            uid, _chain_key(avatar, first, second),
-            step1["url"], second["clean_image_url"], cats[1],
-        )
-        if step2["status"] != "completed":
-            return {"status": "processing", "step": 2}
-
-        steps.append({"garment_id": str(second["item_id"]), "key": step2["key"]})
-        logger.info("outfit try-on user=%s steps=%s cached=%s/%s",
-                    uid, [s["garment_id"] for s in steps], step1["cached"], step2["cached"])
-        return {
-            "status": "completed",
-            "url": step2["url"],
-            "key": step2["key"],
-            "cached": bool(step1["cached"] and step2["cached"]),
-            "steps": steps,
-        }
-
-    except FitCheckException:
-        raise
-    except Exception as exc:
-        raise _wrap_unexpected(exc, uid, f"outfit={ids}") from exc
