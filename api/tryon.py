@@ -1,20 +1,17 @@
-"""
+﻿"""
 Try-On API - V2.
 
-Thin routes. Real work lives in pipelines/tryon_pipeline.py and
-pipelines/tryon_looks_pipeline.py.
+Thin routes. Real work lives in the pipelines below.
 
-POST /api/tryon          body {"garment_id": uuid}
-POST /api/tryon/outfit   body {"garment_ids": [top_uuid, bottom_uuid]}   (chained render)
-  200  {"success": true, "data": {"status": "completed", "url", "key", "cached", ...}}
-  202  {"success": true, "data": {"status": "processing", ...}}  -> retry in ~3 s
-  400  TRYON_OUTFIT_UNSUPPORTED (outfit route: not exactly one top + one bottom)
-  404  avatar / garment not found
-  409  GARMENT_UNSUPPORTED   (shoes, bags, accessories, unknown category)
-  502  TRYON_RENDER_ERROR    (model provider failed; next POST retries)
+Try-On v2 T2-1 B7b (2026-11-25): the old blocking routes POST /api/tryon and
+POST /api/tryon/outfit are RETIRED (the app renders through outfits + jobs since A3).
+Saved looks accept the new body {outfit_id, image_id, name?}; the old body still works.
 
-Saved looks (1+ garments + a try-on render; outfits keep their 2-item rule):
-POST   /api/tryon/looks                 {"garment_ids", "tryon_key", "name"?}  201 new / 200 existing
+Saved looks (1+ garments + a try-on render):
+POST   /api/tryon/looks   {"outfit_id", "image_id", "name"?}          201 new / 200 existing
+                          or (old) {"garment_ids", "tryon_key", "name"?}
+  400 LOOK_BODY_INVALID | LOOK_GARMENT_MISMATCH | LOOK_NAME_TOO_LONG | ...
+  404 OUTFIT_NOT_FOUND | TRYON_RENDER_NOT_FOUND
 GET    /api/tryon/looks?limit&offset    newest first
 PATCH  /api/tryon/looks/{look_id}       {"name": "..." | null}
 DELETE /api/tryon/looks/{look_id}
@@ -26,6 +23,8 @@ POST /api/tryon/outfits  {items: [{garment_id, slot?, fit?}]}  -> outfit (same c
 GET  /api/tryon/outfits/{outfit_id}    -> outfit
   outfit = {outfit_id, items: [{slot, position, garment_id, fit, renders, missing}],
             rendered_slots, tray_slots, needs_generations, cached_image, created_at}
+  fit (B7b) = {silhouette: slim|regular|relaxed|oversized, length: cropped|regular|long,
+               styling: tucked|untucked|front_tuck|layered, rise: low|mid|high}  (all optional)
   400 OUTFIT_EMPTY | SLOT_INVALID | SLOT_CONFLICT | FIT_INVALID
   404 OUTFIT_NOT_FOUND | CLOTHING_ITEM_NOT_FOUND
 
@@ -57,7 +56,6 @@ from pydantic import BaseModel, Field
 
 from shared.dependencies import get_current_user_id
 from shared.models.responses import SuccessResponse
-from pipelines.tryon_pipeline import run_tryon_pipeline, run_outfit_tryon_pipeline
 from pipelines.tryon_looks_pipeline import save_look, list_looks, delete_look, rename_look
 from pipelines.tryon_slots import slots_payload
 from pipelines.tryon_outfits_pipeline import create_outfit, get_outfit
@@ -71,17 +69,12 @@ router = APIRouter(
 )
 
 
-class TryOnRequest(BaseModel):
-    garment_id: UUID
-
-
-class OutfitTryOnRequest(BaseModel):
-    garment_ids: list[UUID]
-
-
 class SaveLookRequest(BaseModel):
-    garment_ids: list[UUID]
-    tryon_key: str
+    # B7b: new body {outfit_id, image_id, name?}; old body {garment_ids, tryon_key, name?}
+    outfit_id: UUID | None = None
+    image_id: UUID | None = None
+    garment_ids: list[UUID] | None = None
+    tryon_key: str | None = None
     name: str | None = None
 
 
@@ -106,7 +99,7 @@ class CreateJobRequest(BaseModel):                 # T2-1 B2
 
 @router.get("/health")
 async def health():
-    return {"service": "tryon", "version": "2.5.0", "status": "healthy"}
+    return {"service": "tryon", "version": "2.6.0", "status": "healthy"}
 
 
 # ---------------------------------------------------------------- T2-1 B1: slots + outfits
@@ -158,57 +151,22 @@ def post_cancel_job(job_id: UUID, user_id: UUID = Depends(get_current_user_id)):
     return SuccessResponse(data=cancel_job(user_id, job_id))
 
 
-@router.post("")
-async def try_on(
-    body: TryOnRequest,
-    response: Response,
-    user_id: UUID = Depends(get_current_user_id),
-):
-    logger.info("Try-on request - user=%s garment=%s", user_id, body.garment_id)
-
-    result = await run_tryon_pipeline(
-        garment_id=body.garment_id,
-        user_id=user_id,
-    )
-
-    if result.get("status") == "processing":
-        response.status_code = 202
-
-    return SuccessResponse(data=result)
-
-
-@router.post("/outfit")
-async def try_on_outfit(
-    body: OutfitTryOnRequest,
-    response: Response,
-    user_id: UUID = Depends(get_current_user_id),
-):
-    logger.info("Outfit try-on request - user=%s garments=%s", user_id, body.garment_ids)
-
-    result = await run_outfit_tryon_pipeline(
-        garment_ids=body.garment_ids,
-        user_id=user_id,
-    )
-
-    if result.get("status") == "processing":
-        response.status_code = 202
-
-    return SuccessResponse(data=result)
-
+# ---------------------------------------------------------------- saved looks
 
 @router.post("/looks")
-async def save_tryon_look(
+def save_tryon_look(
     body: SaveLookRequest,
     response: Response,
     user_id: UUID = Depends(get_current_user_id),
 ):
-    look, created = save_look(user_id, body.garment_ids, body.tryon_key, body.name)
+    look, created = save_look(user_id, garment_ids=body.garment_ids, tryon_key=body.tryon_key,
+                              name=body.name, outfit_id=body.outfit_id, image_id=body.image_id)
     response.status_code = 201 if created else 200
     return SuccessResponse(data=look)
 
 
 @router.get("/looks")
-async def get_tryon_looks(
+def get_tryon_looks(
     limit: int = 50,
     offset: int = 0,
     user_id: UUID = Depends(get_current_user_id),
@@ -217,7 +175,7 @@ async def get_tryon_looks(
 
 
 @router.patch("/looks/{look_id}")
-async def rename_tryon_look(
+def rename_tryon_look(
     look_id: UUID,
     body: RenameLookRequest,
     user_id: UUID = Depends(get_current_user_id),
@@ -226,7 +184,7 @@ async def rename_tryon_look(
 
 
 @router.delete("/looks/{look_id}")
-async def delete_tryon_look(
+def delete_tryon_look(
     look_id: UUID,
     user_id: UUID = Depends(get_current_user_id),
 ):

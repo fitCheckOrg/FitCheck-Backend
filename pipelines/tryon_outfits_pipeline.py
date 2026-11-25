@@ -1,4 +1,4 @@
-"""
+﻿"""
 Try-On v2 T2-1 B1 (2026-11-17): outfits - the chosen garments, by slot, with
 optional fit preferences. An outfit is a VALUE: the same content always gives
 the same outfit_id (tryon_outfits.unique(user_id, content_hash)), so the
@@ -13,6 +13,13 @@ needs_generations = provider renders a "See it on me" would need right now, for 
 user's CURRENT avatar (0 = already rendered / nothing to render; null = no avatar).
 cached_image = the finished render of exactly the rendered pieces, or null.
 Fit preferences never change the render (styling preference only).
+
+B7b (2026-11-25): play-mode style values (Keji's fit principles). fit = any of
+    silhouette: slim | regular | relaxed | oversized     (absent = as the garment is)
+    length:     cropped | regular | long                 (absent = as the garment is)
+    styling:    tucked | untucked | front_tuck | layered (absent = default, untucked for tops)
+    rise:       low | mid | high                         (absent = the garment's own rise)
+"front-tuck" is accepted and stored as "front_tuck". Existing outfits are unchanged.
 
 Tables (T2-1 B1 SQL): tryon_outfits, tryon_outfit_items; function create_tryon_outfit.
 """
@@ -33,7 +40,8 @@ MAX_ITEMS = 10
 FIT_VALUES = {
     "silhouette": ("slim", "regular", "relaxed", "oversized"),
     "length": ("cropped", "regular", "long"),
-    "styling": ("tucked", "untucked", "layered"),
+    "styling": ("tucked", "untucked", "front_tuck", "layered"),
+    "rise": ("low", "mid", "high"),
 }
 
 
@@ -54,7 +62,7 @@ def _clean_fit(raw) -> dict | None:
             raise _bad("FIT_INVALID", f"Unknown fit setting: {key}. Allowed: {', '.join(FIT_VALUES)}.")
         if value is None:
             continue
-        v = str(value).strip().lower()
+        v = str(value).strip().lower().replace("-", "_")
         if v not in FIT_VALUES[key]:
             raise _bad("FIT_INVALID", f"{key} must be one of: {', '.join(FIT_VALUES[key])}.")
         out[key] = v
