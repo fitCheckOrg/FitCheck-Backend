@@ -40,6 +40,13 @@ POST /api/tryon/jobs/{job_id}/cancel                  -> job
   400 NOTHING_TO_RENDER | OUTFIT_EMPTY   404 JOB_NOT_FOUND | AVATAR_NOT_FOUND
   429 RATE_LIMITED (2 renders on the way already)
 
+Try-On Studio B12 (2026-11-26) - recent renders (History), pipelines/render_history.py:
+GET  /api/tryon/jobs?status=succeeded&limit=30&offset=0
+  -> {jobs: [{job_id, outfit_id, created_at, finished_at, items: [{slot, garment_id}], image}],
+      limit, offset, has_more}       newest first, each render once, outdated included
+  400 STATUS_INVALID | PAGE_INVALID
+GET  /api/tryon/jobs (no status) is unchanged: the active list.
+
 Try-On v2 T2-1 B3 (2026-11-17) - quotas:
 GET  /api/tryon/usage   -> {period, used, reserved, limit, remaining, resets_at, tier}
 POST /api/tryon/jobs    also: 429 QUOTA_EXCEEDED {used, reserved, limit, needed, resets_at}
@@ -59,7 +66,8 @@ from shared.models.responses import SuccessResponse
 from pipelines.tryon_looks_pipeline import save_look, list_looks, delete_look, rename_look
 from pipelines.tryon_slots import slots_payload
 from pipelines.tryon_outfits_pipeline import create_outfit, get_outfit
-from pipelines.render_jobs_pipeline import create_job, get_job, list_active, cancel_job, get_usage
+from pipelines.render_jobs_pipeline import create_job, get_job, list_active, cancel_job, get_usage, _bad
+from pipelines.render_history import list_history, DEFAULT_LIMIT
 
 logger = logging.getLogger(__name__)
 
@@ -99,7 +107,7 @@ class CreateJobRequest(BaseModel):                 # T2-1 B2
 
 @router.get("/health")
 async def health():
-    return {"service": "tryon", "version": "2.6.0", "status": "healthy"}
+    return {"service": "tryon", "version": "2.7.0", "status": "healthy"}
 
 
 # ---------------------------------------------------------------- T2-1 B1: slots + outfits
@@ -137,8 +145,15 @@ def read_usage(user_id: UUID = Depends(get_current_user_id)):
 
 
 @router.get("/jobs")
-def read_active_jobs(active: bool = True, user_id: UUID = Depends(get_current_user_id)):
-    return SuccessResponse(data=list_active(user_id))
+def read_jobs(active: bool = True, status: str | None = None,
+              limit: int = DEFAULT_LIMIT, offset: int = 0,
+              user_id: UUID = Depends(get_current_user_id)):
+    """No status -> active jobs (B2, unchanged). status=succeeded -> recent renders (B12)."""
+    if status is None:
+        return SuccessResponse(data=list_active(user_id))
+    if status != "succeeded":
+        raise _bad("STATUS_INVALID", "status can only be 'succeeded'.")
+    return SuccessResponse(data=list_history(user_id, limit, offset))
 
 
 @router.get("/jobs/{job_id}")
