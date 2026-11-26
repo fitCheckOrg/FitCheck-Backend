@@ -27,6 +27,11 @@ async def run_avatar_pipeline(
     Try-On v2 B7 (2026-11-18): the underarm check (old mesh try-on) is gone -
     FASHN needs no landmarks, and it cost ~11 s per upload.
 
+    Try-On Studio B10 (2026-11-26): the background is removed WITHOUT cropping,
+    so processed_photo_url has the same framing as the original photo - which is
+    what FASHN renders from. The stage photo, its body points (pose_keypoints,
+    computed on the processed photo) and every render share one picture frame.
+
     One avatar per user - upserts on conflict.
     Rollback: deletes new S3 images if save fails.
     """
@@ -51,19 +56,16 @@ async def run_avatar_pipeline(
         # 3. Get existing avatar - version + old S3 URLs for cleanup
         existing_version, old_original_url, old_processed_url = _get_existing_avatar(user_id)
 
-        # 4. Remove background
-        processed_bytes = remove_background(image_bytes)
-        logger.info("Step 2/7 - Background removed")
+        # 4. Remove background - no crop (B10): same framing as the original
+        processed_bytes = remove_background(image_bytes, crop=False)
+        logger.info("Step 2/7 - Background removed (uncropped)")
 
         # 5. Enhance
         enhanced_bytes = enhance_image(processed_bytes)
         logger.info("Step 3/7 - Image enhanced")
 
-        # Capture ACTUAL final dimensions - after crop, after enhance -
-        # not the original pre-crop dimensions. remove.bg's crop=true
-        # (added for wardrobe, shared by this pipeline) changes both
-        # size AND aspect ratio, so this can't be assumed to match
-        # the original upload.
+        # Actual final dimensions of the processed photo (remove.bg and the
+        # enhancer may scale it down; the aspect ratio stays the original's).
         from PIL import Image
         import io as _io
         final_image = Image.open(_io.BytesIO(enhanced_bytes))
@@ -76,15 +78,8 @@ async def run_avatar_pipeline(
         body_profile_ai["photo_accuracy"] = accuracy
         logger.info("Step 4/7 - Body analysis complete")
 
-        # 4b. Estimate pose keypoints on the FINAL PROCESSED photo -
-        # must match the coordinate system of processed_photo_url,
-        # which is what pose_keypoints will be applied against
-        # downstream. Previously ran on image_bytes (the ORIGINAL,
-        # pre-crop upload) while processed_photo_url stores the
-        # POST-crop image - a real aspect-ratio mismatch (confirmed
-        # via direct measurement: 0.5627 vs 0.3314, 41.1% difference)
-        # that silently corrupted every downstream landmark
-        # calculation using these normalized coordinates.
+        # 4b. Pose keypoints on the FINAL PROCESSED photo - fractions of
+        # processed_photo_url (and, since B10, of the original and the renders too).
         pose_keypoints = estimate_pose(enhanced_bytes)
         if pose_keypoints:
             logger.info("Step 4b/7 - Pose keypoints detected")
@@ -148,7 +143,7 @@ async def run_avatar_pipeline(
 
         return saved_avatar
 
-    except Exception as e:
+    except Exception:
         logger.exception("Avatar pipeline failed")
         _rollback(original_key, processed_key)
         raise
