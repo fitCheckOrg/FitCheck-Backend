@@ -39,6 +39,10 @@ model_name "tryon-v1.6", 1 credit per image, key FASHN_API_KEY in .env).
   * FASHN has no cancel endpoint: cancel() only logs (the render finishes and is cached).
   * name stays "fal-fashn-v1.6": same model, so existing cached renders keep matching.
 
+B13 (2026-11-26): when FASHN refuses a render for credits (HTTP 402, or an error that
+mentions credits), submit() tells pipelines/fashn_credits.py, which pauses new paid
+renders and alerts the developer.
+
 Smoke test (server must be running on :8000; costs 1 FASHN credit):
     python -m tryon.vto_renderer
 """
@@ -293,6 +297,12 @@ class FashnApiRenderer(TryOnRenderer):
             data = {}
         if r.status_code != 200 or not data.get("id"):
             detail = _fashn_error(data) if data else r.text[:300]
+            if r.status_code == 402 or "credit" in str(detail).lower():
+                try:
+                    from pipelines.fashn_credits import note_out_of_credits
+                    note_out_of_credits(f"HTTP {r.status_code}: {detail}")
+                except Exception:
+                    logger.exception("couldn't report the out-of-credits refusal")
             raise TryOnRenderError(f"{self.name} submit refused ({r.status_code}): {detail}")
         return data["id"]
 

@@ -31,6 +31,9 @@ B3 (2026-11-17) - quotas, limits, ceiling (all numbers are .env settings):
     RENDER_DAILY_CEILING    100   generations sent to the provider per UTC day, all users -> 503 RENDERS_PAUSED
   Order: hourly limit -> already rendered (free, opens even when paused / out of renders)
          -> same render on its way -> active / quota / ceiling (one locked DB step).
+  B13 (2026-11-26): FASHN credits used up (or new renders paused by hand on the Developer
+  screen) -> 503 RENDERS_PAUSED {retry_after} before anything is queued; already-rendered
+  outfits still open. See pipelines/fashn_credits.py.
   "used" = charged generations this month; "reserved" = renders still expected by my
   queued / running jobs. A job is charged only when it SUCCEEDS (finish_render_job).
 """
@@ -253,6 +256,14 @@ def create_job(user_id, outfit_id=None, items=None) -> tuple[dict, bool]:
         }).execute().data[0]
         logger.info("render job %s cached user=%s", row["job_id"], uid)
         return _shape(row), False
+
+    # B13: no new paid renders while FASHN credits are used up / renders are paused by hand.
+    from pipelines.fashn_credits import renders_blocked
+    if renders_blocked():
+        logger.warning("render job refused: new renders paused (credits / by hand) user=%s", uid)
+        raise _bad("RENDERS_PAUSED", "Try-on is taking a short break. Your saved and earlier looks "
+                   "still open; new renders will be back soon.", 503,
+                   {"Retry-After": "900"}, {"retry_after": 900})
 
     # 2 + 3. Same render on its way -> that job; otherwise admit (active jobs, monthly
     # quota, daily ceiling) and create - one locked step in the database (B3).

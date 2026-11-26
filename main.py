@@ -32,6 +32,8 @@ from core.storage.sign_middleware import SignPrivateLinks
 from pipelines.push_pipeline import push_worker
 from pipelines.render_worker import render_worker
 from pipelines.outdated_pipeline import cleanup_worker
+from pipelines.fashn_credits import credit_monitor
+from api.dev import router as dev_router
 import asyncio
 
 
@@ -56,6 +58,11 @@ async def start_render_worker():
 @app.on_event("startup")
 async def start_cleanup_worker():
     asyncio.create_task(cleanup_worker())
+
+# Try-On Studio B13: FASHN credit monitor (developer alerts; pauses renders at 0).
+@app.on_event("startup")
+async def start_credit_monitor():
+    asyncio.create_task(credit_monitor())
 
 # Global exception handler - no try/except in routes
 @app.exception_handler(FitCheckException)
@@ -147,6 +154,8 @@ app.include_router(suggested_router, prefix="/api")
 app.include_router(recreate_router, prefix="/api")
 # E20: public share pages + app-link files, NO /api prefix (fitcheck.app/p/{id})
 app.include_router(share_page_router)
+# Try-On Studio B13: developer-only routes (DEV_USER_IDS in .env; 404 for everyone else)
+app.include_router(dev_router, prefix="/api")
 
 
 
