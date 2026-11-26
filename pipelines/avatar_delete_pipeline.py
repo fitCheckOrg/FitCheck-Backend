@@ -6,7 +6,10 @@ AV-6: delete EVERYTHING derived from the user's photo (privacy).
   * avatar photos (original + processed) and any other files under the
     user's avatar folders in S3 (old versions, landmark/mask assets)
   * every try-on render of this user (tryon_renders rows + their S3 images)
-  * every saved look (tryon_looks rows) - a look's picture IS a try-on render
+  * every saved look WITH a try-on picture (tryon_looks rows that have a tryon_key)
+    - a look's picture IS a try-on render.
+    Try-On Studio B16 (2026-11-26): board-only looks (clothes only, no picture of
+    the person) are kept - nothing in them comes from the photo.
   * the avatars row itself (body profile, pose keypoints, landmarks)
 
 Order: S3 files first, then database rows. If a file delete fails it is
@@ -61,7 +64,7 @@ def delete_avatar_everything(user_id: str) -> dict:
     renders = supabase.table("tryon_renders").select("id, s3_key")\
         .eq("user_id", user_id).execute().data or []
     looks = supabase.table("tryon_looks").select("look_id, tryon_key")\
-        .eq("user_id", user_id).execute().data or []
+        .eq("user_id", user_id).not_.is_("tryon_key", "null").execute().data or []
 
     # 1. Files we know by key
     keys = {
@@ -84,7 +87,8 @@ def delete_avatar_everything(user_id: str) -> dict:
         files_deleted += _delete_prefix(prefix)
 
     # 3. Database rows
-    supabase.table("tryon_looks").delete().eq("user_id", user_id).execute()
+    supabase.table("tryon_looks").delete().eq("user_id", user_id)\
+        .not_.is_("tryon_key", "null").execute()
     supabase.table("tryon_renders").delete().eq("user_id", user_id).execute()
     supabase.table("avatars").delete().eq("user_id", user_id).execute()
 

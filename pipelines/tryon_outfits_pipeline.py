@@ -21,6 +21,12 @@ B7b (2026-11-25): play-mode style values (Keji's fit principles). fit = any of
     rise:       low | mid | high                         (absent = the garment's own rise)
 "front-tuck" is accepted and stored as "front_tuck". Existing outfits are unchanged.
 
+Try-On Studio B16 (2026-11-26): the board layout - an opaque JSON object the app owns
+(nudges, board surface, ...), at most 4 KB, stored with the outfit:
+    PUT /api/tryon/outfits/{outfit_id}/layout  {"layout": {...} | null}   -> outfit
+    every outfit returns "layout" (null when none was saved).
+The layout never changes the outfit id, the render or its cost.
+
 Tables (T2-1 B1 SQL): tryon_outfits, tryon_outfit_items; function create_tryon_outfit.
 """
 
@@ -37,6 +43,7 @@ from pipelines.tryon_slots import SLOTS, SLOT_ORDER, allowed_slots, slot_for_cat
 logger = logging.getLogger(__name__)
 
 MAX_ITEMS = 10
+MAX_LAYOUT_BYTES = 4096
 FIT_VALUES = {
     "silhouette": ("slim", "regular", "relaxed", "oversized"),
     "length": ("cropped", "regular", "long"),
@@ -67,6 +74,24 @@ def _clean_fit(raw) -> dict | None:
             raise _bad("FIT_INVALID", f"{key} must be one of: {', '.join(FIT_VALUES[key])}.")
         out[key] = v
     return {k: out[k] for k in sorted(out)} or None
+
+
+def clean_layout(raw) -> dict | None:
+    """B16: the app's board layout - any JSON object up to 4 KB, or null."""
+    if raw is None:
+        return None
+    if not isinstance(raw, dict):
+        raise _bad("LAYOUT_INVALID", "layout must be a JSON object (or null).")
+    size = len(json.dumps(raw, separators=(",", ":"), ensure_ascii=False).encode("utf-8"))
+    if size > MAX_LAYOUT_BYTES:
+        raise _bad("LAYOUT_TOO_BIG", f"layout must be {MAX_LAYOUT_BYTES} bytes or less (it is {size}).")
+    return raw
+
+
+def outfit_layout(uid: str, outfit_id: str) -> dict | None:
+    rows = supabase.table("tryon_outfits").select("layout")\
+        .eq("outfit_id", outfit_id).eq("user_id", uid).limit(1).execute().data
+    return rows[0].get("layout") if rows else None
 
 
 def _load_garments(uid: str, ids: list[str]) -> dict[str, dict]:
@@ -144,7 +169,7 @@ def get_outfit(user_id, outfit_id) -> dict:
         oid = str(UUID(str(outfit_id)))
     except Exception:
         raise _bad("OUTFIT_NOT_FOUND", "Outfit not found.", 404)
-    head = supabase.table("tryon_outfits").select("outfit_id, created_at")\
+    head = supabase.table("tryon_outfits").select("outfit_id, created_at, layout")\
         .eq("outfit_id", oid).eq("user_id", uid).limit(1).execute().data
     if not head:
         raise _bad("OUTFIT_NOT_FOUND", "Outfit not found.", 404)
@@ -167,8 +192,24 @@ def get_outfit(user_id, outfit_id) -> dict:
         "tray_slots": tray_slots,
         "needs_generations": needs,
         "cached_image": cached,
+        "layout": head[0].get("layout"),
         "created_at": head[0]["created_at"],
     }
+
+
+def set_layout(user_id, outfit_id, layout) -> dict:
+    """B16: save (or clear with null) the board layout of one of the user's outfits."""
+    uid = str(user_id)
+    try:
+        oid = str(UUID(str(outfit_id)))
+    except Exception:
+        raise _bad("OUTFIT_NOT_FOUND", "Outfit not found.", 404)
+    clean = clean_layout(layout)
+    res = supabase.table("tryon_outfits").update({"layout": clean})\
+        .eq("outfit_id", oid).eq("user_id", uid).execute()
+    if not res.data:
+        raise _bad("OUTFIT_NOT_FOUND", "Outfit not found.", 404)
+    return get_outfit(uid, oid)
 
 
 # ---------------------------------------------------------------- create

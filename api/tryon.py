@@ -13,8 +13,16 @@ POST   /api/tryon/looks   {"outfit_id", "image_id", "name"?}          201 new / 
   400 LOOK_BODY_INVALID | LOOK_GARMENT_MISMATCH | LOOK_NAME_TOO_LONG | ...
   404 OUTFIT_NOT_FOUND | TRYON_RENDER_NOT_FOUND
 GET    /api/tryon/looks?limit&offset    newest first
-PATCH  /api/tryon/looks/{look_id}       {"name": "..." | null}
+PATCH  /api/tryon/looks/{look_id}       {"name"?: "..." | null, "layout"?: {...} | null}  (B16: only fields sent)
 DELETE /api/tryon/looks/{look_id}
+
+Try-On Studio B16 (2026-11-26) - board looks + board layout:
+POST   /api/tryon/looks   {"outfit_id", "name"?, "layout"?}   (no image_id) -> look kind "board",
+                          image null; 201 new / 200 this outfit is already saved
+       later {"outfit_id", "image_id"} fills that look's picture (same look_id, kind "photo", 200)
+PUT    /api/tryon/outfits/{outfit_id}/layout  {"layout": {...} | null}  -> outfit (with "layout")
+  every look: kind "photo" | "board", layout (<= 4 KB JSON object the app owns) | null
+  400 LAYOUT_INVALID | LAYOUT_TOO_BIG
 
 Try-On v2 T2-1 B1 (2026-11-17):
 GET  /api/tryon/slots                  -> {slots: [{slot, renders, max, excludes, tray_when, categories}],
@@ -63,9 +71,9 @@ from pydantic import BaseModel, Field
 
 from shared.dependencies import get_current_user_id
 from shared.models.responses import SuccessResponse
-from pipelines.tryon_looks_pipeline import save_look, list_looks, delete_look, rename_look
+from pipelines.tryon_looks_pipeline import save_look, list_looks, delete_look, update_look
 from pipelines.tryon_slots import slots_payload
-from pipelines.tryon_outfits_pipeline import create_outfit, get_outfit
+from pipelines.tryon_outfits_pipeline import create_outfit, get_outfit, set_layout
 from pipelines.render_jobs_pipeline import create_job, get_job, list_active, cancel_job, get_usage, _bad
 from pipelines.render_history import list_history, DEFAULT_LIMIT
 
@@ -84,10 +92,17 @@ class SaveLookRequest(BaseModel):
     garment_ids: list[UUID] | None = None
     tryon_key: str | None = None
     name: str | None = None
+    layout: dict | None = None                     # B16
 
 
 class RenameLookRequest(BaseModel):
+    # B16: PATCH changes only the fields that are sent
     name: str | None = None
+    layout: dict | None = None
+
+
+class LayoutRequest(BaseModel):                    # B16
+    layout: dict | None = None
 
 
 class OutfitItem(BaseModel):                       # T2-1 B1
@@ -107,7 +122,7 @@ class CreateJobRequest(BaseModel):                 # T2-1 B2
 
 @router.get("/health")
 async def health():
-    return {"service": "tryon", "version": "2.7.0", "status": "healthy"}
+    return {"service": "tryon", "version": "2.8.0", "status": "healthy"}
 
 
 # ---------------------------------------------------------------- T2-1 B1: slots + outfits
@@ -126,6 +141,12 @@ def post_outfit(body: CreateOutfitRequest, user_id: UUID = Depends(get_current_u
 @router.get("/outfits/{outfit_id}")
 def read_outfit(outfit_id: UUID, user_id: UUID = Depends(get_current_user_id)):
     return SuccessResponse(data=get_outfit(user_id, outfit_id))
+
+
+@router.put("/outfits/{outfit_id}/layout")
+def put_outfit_layout(outfit_id: UUID, body: LayoutRequest,
+                      user_id: UUID = Depends(get_current_user_id)):
+    return SuccessResponse(data=set_layout(user_id, outfit_id, body.layout))
 
 
 # ---------------------------------------------------------------- T2-1 B2: render jobs
@@ -175,7 +196,8 @@ def save_tryon_look(
     user_id: UUID = Depends(get_current_user_id),
 ):
     look, created = save_look(user_id, garment_ids=body.garment_ids, tryon_key=body.tryon_key,
-                              name=body.name, outfit_id=body.outfit_id, image_id=body.image_id)
+                              name=body.name, outfit_id=body.outfit_id, image_id=body.image_id,
+                              layout=body.layout, layout_sent="layout" in body.model_fields_set)
     response.status_code = 201 if created else 200
     return SuccessResponse(data=look)
 
@@ -195,7 +217,8 @@ def rename_tryon_look(
     body: RenameLookRequest,
     user_id: UUID = Depends(get_current_user_id),
 ):
-    return SuccessResponse(data=rename_look(user_id, look_id, body.name))
+    fields = {k: getattr(body, k) for k in body.model_fields_set}
+    return SuccessResponse(data=update_look(user_id, look_id, fields))
 
 
 @router.delete("/looks/{look_id}")
