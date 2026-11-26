@@ -1,8 +1,25 @@
+"""
+Body pose on an avatar photo (MediaPipe PoseLandmarker, Tasks API).
+
+Try-On Studio B10 (2026-11-26):
+  * no temp file any more - the image goes to MediaPipe from memory (the old shared
+    _tmp_pose_input.png could be overwritten by a second upload running at the same time);
+  * the detector is used under a lock (one MediaPipe detector isn't safe across threads);
+  * a transparent photo is placed on light grey first, so the model sees a clean
+    background instead of whatever colour the transparent pixels happen to hold.
+"""
+
+import io
+import threading
+
 import mediapipe as mp
+import numpy as np
 from mediapipe.tasks import python
 from mediapipe.tasks.python import vision
-from shared.logger import get_logger
+from PIL import Image
+
 from core.config.settings import settings
+from shared.logger import get_logger
 
 logger = get_logger(__name__)
 
@@ -18,36 +35,48 @@ LANDMARK_NAMES = [
     "left_foot_index", "right_foot_index"
 ]
 
+BACKDROP = (232, 232, 234)          # light grey behind transparent pixels
+
 _base_options = python.BaseOptions(model_asset_path=settings.POSE_MODEL_PATH)
 _options = vision.PoseLandmarkerOptions(
     base_options=_base_options,
     running_mode=vision.RunningMode.IMAGE
 )
 _detector = vision.PoseLandmarker.create_from_options(_options)
+_lock = threading.Lock()
+
+
+def _rgb_array(image_bytes: bytes) -> np.ndarray:
+    img = Image.open(io.BytesIO(image_bytes))
+    if img.mode in ("RGBA", "LA") or (img.mode == "P" and "transparency" in img.info):
+        rgba = img.convert("RGBA")
+        flat = Image.new("RGB", rgba.size, BACKDROP)
+        flat.paste(rgba, mask=rgba.split()[3])
+        img = flat
+    else:
+        img = img.convert("RGB")
+    return np.ascontiguousarray(np.asarray(img, dtype=np.uint8))
 
 
 def estimate_pose(image_bytes: bytes) -> dict | None:
     """
-    Runs MediaPipe's PoseLandmarker (Tasks API) on an image, returns
-    normalized (0.0-1.0) coordinates for all 33 body landmarks, plus
-    MediaPipe's own visibility and presence confidence scores.
+    Normalized (0.0-1.0, fractions of THIS image) coordinates for all 33 body
+    landmarks, plus MediaPipe's visibility and presence scores.
+    MediaPipe's "left" is the person's left.
 
-    Returns None on failure/no-detection — pose data is an
-    enhancement, never a blocking requirement for avatar creation.
+    Returns None on failure / no detection - pose data is an enhancement,
+    never a blocking requirement for avatar creation.
     """
     try:
-        with open("_tmp_pose_input.png", "wb") as f:
-            f.write(image_bytes)
-        mp_image = mp.Image.create_from_file("_tmp_pose_input.png")
-
-        result = _detector.detect(mp_image)
+        mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=_rgb_array(image_bytes))
+        with _lock:
+            result = _detector.detect(mp_image)
 
         if not result.pose_landmarks:
-            logger.warning("Pose estimation — no pose detected in image")
+            logger.warning("Pose estimation - no pose detected in image")
             return None
 
         detected = result.pose_landmarks[0]  # first detected person
-
         landmarks = {}
         for name, point in zip(LANDMARK_NAMES, detected):
             landmarks[name] = {
@@ -57,7 +86,7 @@ def estimate_pose(image_bytes: bytes) -> dict | None:
                 "presence": round(point.presence, 4)
             }
 
-        logger.info("Pose estimation successful — %d landmarks detected", len(landmarks))
+        logger.info("Pose estimation successful - %d landmarks detected", len(landmarks))
         return landmarks
 
     except Exception:
