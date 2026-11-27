@@ -35,6 +35,12 @@ class ClothingItem(BaseModel):
     is_archived: bool = False
     created_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
     asset_revision: str | None = None
+    # Try-On Studio B14-0 (2026-11-27): sharp cut-out for the board (null = not made
+    # yet - use clean_image_url). bbox = [x, y, w, h] of the visible garment, fractions.
+    cutout_url: str | None = None
+    cutout_width: int | None = None
+    cutout_height: int | None = None
+    cutout_bbox: list[float] | None = None
 
     class Config:
         json_encoders = { uuid.UUID: str }

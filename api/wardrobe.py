@@ -208,12 +208,13 @@ async def update_wardrobe_item(
 
 @router.delete("/{item_id}", response_model=SuccessResponse)
 async def delete_wardrobe_item(item_id: UUID, user_id: UUID = Depends(get_current_user_id)):
-    """Delete clothing item + S3 images"""
+    """Delete clothing item + S3 images (original, clean cut-out and, since B14-0,
+    the sharp cut-out when it is a separate file)."""
     logger.info(f"Delete item={item_id} user={user_id}")
 
     # Get item first
     result = supabase.table("closet_items")\
-        .select("original_image_url, clean_image_url")\
+        .select("original_image_url, clean_image_url, cutout_url")\
         .eq("item_id", str(item_id))\
         .eq("user_id", str(user_id))\
         .single()\
@@ -225,12 +226,16 @@ async def delete_wardrobe_item(item_id: UUID, user_id: UUID = Depends(get_curren
     item = result.data
 
     # Delete S3 first
-    for url_key in ["original_image_url", "clean_image_url"]:
+    keys = []
+    for url_key in ["original_image_url", "clean_image_url", "cutout_url"]:
         url = item.get(url_key)
         if url:
             key = url.split(".amazonaws.com/")[-1]
-            storage.delete(key)
-            logger.info(f"S3 deleted: {key}")
+            if key not in keys:                 # new uploads: cutout_url = clean_image_url
+                keys.append(key)
+    for key in keys:
+        storage.delete(key)
+        logger.info(f"S3 deleted: {key}")
 
     #delete from DB
     supabase.table("closet_items")\
